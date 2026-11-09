@@ -1620,6 +1620,33 @@ class ImmersionConfig:
     # How much of it there is. "quiet" is the callouts and nothing else;
     # "chatty" adds the small talk a long cruise actually has in it.
     verbosity: str = "normal"          # quiet | normal | chatty
+
+    # --- autonomous flight ---
+    # When enabled, the First Officer flies the aircraft from startup to
+    # shutdown using the simulator's autopilot and systems. This includes
+    # managing all phases of flight: preflight, pushback, taxi, takeoff,
+    # climb, cruise, descent, approach, landing, taxi-in, and shutdown.
+    autonomous_flight: bool = False
+    # When enabled along with autonomous_flight, the First Officer will
+    # automatically load and fly the next flight in the chain after shutdown.
+    # Requires a flight plan file or SimBrief plan queue.
+    autonomous_chained_flights: bool = False
+    # How the First Officer manages the autopilot: "managed" uses the
+    # aircraft's FMS/autopilot modes (HDG, ALT, NAV, APR), "direct" uses
+    # SimConnect events to set references directly. "managed" is more
+    # realistic for modern airliners; "direct" works on more aircraft.
+    autonomous_ap_mode: str = "managed"   # managed | direct
+    # Minimum time between flights in a chain (seconds). Allows time for
+    # shutdown, repositioning, and preflight of the next flight.
+    autonomous_chain_delay_s: float = 120.0
+    # Whether to automatically request IFR clearance when available in
+    # autonomous mode. When False, only VFR or flight-following is used.
+    autonomous_request_ifr: bool = True
+    # Whether to use the simulator's AI pilot (AI Control) for parts of the
+    # flight the First Officer doesn't explicitly manage. Off by default
+    # because it conflicts with explicit autopilot control.
+    autonomous_use_sim_ai: bool = False
+
     # The controller's half (see ControllerRealismConfig).
     controller: ControllerRealismConfig = field(
         default_factory=ControllerRealismConfig)
@@ -1631,6 +1658,7 @@ CREW_LANGUAGES = ("auto", "en", "fr", "de", "nl")
 _FO = dict(tab="first_officer", group="first_officer")
 _CABIN = dict(tab="immersion", group="cabin")
 _MANNER = dict(tab="immersion", group="crew_manner")
+_AUTONOMOUS = dict(tab="immersion", group="autonomous_flight")
 describe(
     ImmersionConfig,
     enabled=Setting("immersion", "crew", label="set.immersion",
@@ -1682,6 +1710,20 @@ describe(
     verbosity=Setting(choices=("quiet", "normal", "chatty"),
                       choice_keys=("set.quiet", "set.normal", "set.chatty"),
                       label="set.how_much", **_MANNER),
+    autonomous_flight=Setting(label="set.autonomous_flight",
+                              help="set.autonomous_flight_why", **_AUTONOMOUS),
+    autonomous_chained_flights=Setting(label="set.autonomous_chained",
+                                       help="set.autonomous_chained_why", **_AUTONOMOUS),
+    autonomous_ap_mode=Setting(choices=("managed", "direct"),
+                               choice_keys=("set.ap_mode_managed", "set.ap_mode_direct"),
+                               label="set.autonomous_ap_mode", **_AUTONOMOUS),
+    autonomous_chain_delay_s=Setting(min=30, max=3600, step=30, unit="s",
+                                     label="set.autonomous_chain_delay",
+                                     **_AUTONOMOUS),
+    autonomous_request_ifr=Setting(label="set.autonomous_request_ifr",
+                                   help="set.autonomous_request_ifr_why", **_AUTONOMOUS),
+    autonomous_use_sim_ai=Setting(label="set.autonomous_use_sim_ai",
+                                  help="set.autonomous_use_sim_ai_why", **_AUTONOMOUS),
 )
 
 

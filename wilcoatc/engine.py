@@ -30,6 +30,7 @@ from .atc.atis import AtisGenerator, AtisReport
 from .atc.controller import ControllerBrain, Reply
 from .atc import interphone
 from .atc.crew import CrewDirector
+from .atc.autonomous import AutonomousFlight, create_autonomous_flight
 from .atc.intents import Intent, IntentParser, ParsedIntent
 from .atc.landing import LandingMonitor
 from .atc.phraseology import Aircraft, Phraseology, Weather, wake_suffix
@@ -285,6 +286,15 @@ class Engine:
         self.crew.distance_to_field = self._distance_to_field
         self.crew.radio_call = self.first_officer_call
         self.crew.transmit = self.first_officer_transmits
+
+        # Autonomous flight (First Officer flying the aircraft)
+        self.autonomous_flight: AutonomousFlight | None = None
+        if self.config.immersion.autonomous_flight:
+            self.autonomous_flight = create_autonomous_flight(
+                self.config, self.navdb, None, None, self.crew, self.brain,
+                lambda: self.state, self.emit
+            )
+
         # Rules first; the AI layer only sees what they could not classify.
         self.parser = IntentParser()
         self.understanding = Understanding(
@@ -1295,6 +1305,10 @@ class Engine:
                 log.debug("could not close the previous state source",
                           exc_info=True)
 
+        # Update autonomous flight with the new sim source
+        if self.autonomous_flight and hasattr(self.autonomous_flight, 'sim'):
+            self.autonomous_flight.sim = sim
+
         self.emit("info", "Connected to the simulator.", key="log.sim_connected")
         # The ground handling, which needs the simulator to be there before
         # it can open a channel of its own. It used to be written and never
@@ -1732,6 +1746,9 @@ class Engine:
         # A new flight is a new crew: whatever the last one had already said
         # is forgotten, or the safety briefing never happens again.
         self.crew.begin(session, self.last_language)
+        # Initialize autonomous flight for this session
+        if self.autonomous_flight:
+            self.autonomous_flight.begin_flight(session)
         self._check_announcements()
         # And a new runway, so a departure held on the last flight is not
         # still waiting for it to clear on this one.
@@ -3507,6 +3524,13 @@ class Engine:
             self.crew.follow(previous, state, session)
         except Exception:
             log.debug("the crew raised", exc_info=True)
+
+        # Autonomous flight tick (First Officer flying the aircraft)
+        if self.autonomous_flight:
+            try:
+                self.autonomous_flight.tick()
+            except Exception:
+                log.debug("autonomous flight raised", exc_info=True)
 
         if self.config.traffic.enabled:
             self._run_traffic(state, session)
