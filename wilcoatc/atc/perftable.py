@@ -70,7 +70,7 @@ class TypePerf:
 # threshold speed, so the approach speed is read from the approach IAS.
 HELI_TYPES: frozenset[str] = frozenset({
     "R44", "R66", "H125", "AS50", "EC30", "B06", "B407", "EC35", "EC45",
-    "S76", "A109", "A139", "B412", "UH1",
+    "H145", "H160", "AS32", "S76", "A109", "A139", "B412", "UH1",
 })
 
 # The figures, keyed by the type code the traffic flies. ``db`` names the
@@ -119,9 +119,14 @@ TABLE: dict[str, TypePerf] = {
     "PC12": TypePerf(db="PC12", v2_kt=110, takeoff_m=600, climb_ias_kt=130, climb_roc_fpm=1700, climb150_ias_kt=130, cruise_tas_kt=270, ceiling_ft=30000, range_nm=2000, descent_rod_fpm=1500, approach_ias_kt=180, vat_kt=85, wtc="L", recat="Light"),
     "TBM9": TypePerf(db="TBM8", v2_kt=110, takeoff_m=870, climb_ias_kt=160, climb_roc_fpm=2400, climb150_ias_kt=180, cruise_tas_kt=300, ceiling_ft=31000, range_nm=1520, descent_rod_fpm=1500, approach_ias_kt=160, vat_kt=95, wtc="L", recat="Light"),
     "R44": TypePerf(db="R44", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1000, climb150_ias_kt=0, cruise_tas_kt=110, ceiling_ft=14000, range_nm=300, descent_rod_fpm=1000, approach_ias_kt=80, vat_kt=15, wtc="L", recat="Light"),
-    "R66": TypePerf(db="H25A", v2_kt=124, takeoff_m=1247, climb_ias_kt=140, climb_roc_fpm=3700, climb150_ias_kt=290, cruise_tas_kt=400, ceiling_ft=41000, range_nm=1680, descent_rod_fpm=2200, approach_ias_kt=210, vat_kt=125, wtc="M", recat="Light"),
-    "H125": TypePerf(db="H25A", v2_kt=124, takeoff_m=1247, climb_ias_kt=140, climb_roc_fpm=3700, climb150_ias_kt=290, cruise_tas_kt=400, ceiling_ft=41000, range_nm=1680, descent_rod_fpm=2200, approach_ias_kt=210, vat_kt=125, wtc="M", recat="Light"),
-    "AS50": TypePerf(db="H25C", v2_kt=125, takeoff_m=1900, climb_ias_kt=155, climb_roc_fpm=3500, climb150_ias_kt=290, cruise_tas_kt=450, ceiling_ft=43000, range_nm=3100, descent_rod_fpm=4000, approach_ias_kt=250, vat_kt=132, wtc="M", recat="Light"),
+    # The database's H25A and H25C entries are fixed-wing figures -- a
+    # "helicopter" that climbs at 3,700 fpm to FL410 is the aeroplane bug
+    # this table exists to fix, so these three read the rows their kin
+    # actually have instead: the Bell 430 for the H125/R66 light singles,
+    # the EC35 for the Dauphin and the EC-family twins.
+    "R66": TypePerf(db="B430", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1400, climb150_ias_kt=0, cruise_tas_kt=130, ceiling_ft=14600, range_nm=324, descent_rod_fpm=1000, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
+    "H125": TypePerf(db="B430", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1400, climb150_ias_kt=0, cruise_tas_kt=130, ceiling_ft=14600, range_nm=324, descent_rod_fpm=1000, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
+    "AS50": TypePerf(db="EC35", v2_kt=0, takeoff_m=0, climb_ias_kt=110, climb_roc_fpm=1500, climb150_ias_kt=110, cruise_tas_kt=135, ceiling_ft=20000, range_nm=340, descent_rod_fpm=1500, approach_ias_kt=90, vat_kt=5, wtc="L", recat="Light"),
     "EC30": TypePerf(db="EC35", v2_kt=0, takeoff_m=0, climb_ias_kt=110, climb_roc_fpm=1500, climb150_ias_kt=110, cruise_tas_kt=135, ceiling_ft=20000, range_nm=340, descent_rod_fpm=1500, approach_ias_kt=90, vat_kt=5, wtc="L", recat="Light"),
     "B06": TypePerf(db="B06", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1350, climb150_ias_kt=0, cruise_tas_kt=120, ceiling_ft=13500, range_nm=374, descent_rod_fpm=1100, approach_ias_kt=80, vat_kt=40, wtc="L", recat="Light"),
     "B407": TypePerf(db="B430", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1400, climb150_ias_kt=0, cruise_tas_kt=130, ceiling_ft=14600, range_nm=324, descent_rod_fpm=1000, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
@@ -132,6 +137,12 @@ TABLE: dict[str, TypePerf] = {
     "A139": TypePerf(db="B412", v2_kt=0, takeoff_m=0, climb_ias_kt=80, climb_roc_fpm=1300, climb150_ias_kt=100, cruise_tas_kt=125, ceiling_ft=20000, range_nm=402, descent_rod_fpm=1000, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
     "B412": TypePerf(db="B412", v2_kt=0, takeoff_m=0, climb_ias_kt=80, climb_roc_fpm=1300, climb150_ias_kt=100, cruise_tas_kt=125, ceiling_ft=20000, range_nm=402, descent_rod_fpm=1000, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
     "UH1": TypePerf(db="UH1", v2_kt=0, takeoff_m=0, climb_ias_kt=60, climb_roc_fpm=1755, climb150_ias_kt=80, cruise_tas_kt=110, ceiling_ft=19000, range_nm=275, descent_rod_fpm=1200, approach_ias_kt=60, vat_kt=40, wtc="L", recat="Light"),
+    # No database row for the H145, the H160 or the Super Puma; the EC35
+    # is the closest published kin for all three, the same stand-in the
+    # first officer's own rotorcraft profiles use.
+    "H145": TypePerf(db="EC35", v2_kt=0, takeoff_m=0, climb_ias_kt=110, climb_roc_fpm=1500, climb150_ias_kt=110, cruise_tas_kt=135, ceiling_ft=20000, range_nm=340, descent_rod_fpm=1500, approach_ias_kt=90, vat_kt=5, wtc="L", recat="Light"),
+    "H160": TypePerf(db="EC35", v2_kt=0, takeoff_m=0, climb_ias_kt=110, climb_roc_fpm=1500, climb150_ias_kt=110, cruise_tas_kt=135, ceiling_ft=20000, range_nm=340, descent_rod_fpm=1500, approach_ias_kt=90, vat_kt=5, wtc="L", recat="Light"),
+    "AS32": TypePerf(db="EC35", v2_kt=0, takeoff_m=0, climb_ias_kt=110, climb_roc_fpm=1500, climb150_ias_kt=110, cruise_tas_kt=135, ceiling_ft=20000, range_nm=340, descent_rod_fpm=1500, approach_ias_kt=90, vat_kt=5, wtc="L", recat="Light"),
 }
 
 # The takeoff roll's acceleration is worked out from V2 and the takeoff
@@ -175,6 +186,10 @@ def traffic_performance(type_code: str, light: bool = False) -> Performance:
         # cruise TAS would have it racing at flight level, which is not what
         # this number is for.
         more["cruise_kt"] = perf.climb150_ias_kt
+    elif (type_code or "").upper() in HELI_TYPES and perf.cruise_tas_kt > 0:
+        # A rotorcraft has no FL150 leg to read; its cruise TAS is the
+        # figure, and the class fallback would leave it at jet speed.
+        more["cruise_kt"] = perf.cruise_tas_kt
     if perf.descent_rod_fpm > 0:
         more["descend_fpm"] = perf.descent_rod_fpm
     # Final-approach speed: the landing Vat for a fixed-wing, the approach
@@ -209,6 +224,10 @@ def range_for(type_code: str, light: bool = False) -> float:
         return 450.0
     if code in fly._TURBOPROP_TYPES:
         return 1200.0
+    if code in HELI_TYPES:
+        # A rotorcraft the table does not know still does not fly an
+        # airliner's leg.
+        return 400.0
     return 2500.0
 
 

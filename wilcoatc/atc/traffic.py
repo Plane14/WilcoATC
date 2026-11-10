@@ -2972,8 +2972,11 @@ class TrafficInjector:
             prefixes = operator.home + operator.region
             fleet = set(operator.fleet)
             regional = bool(fleet) and fleet <= set(REGIONAL)
+            heavy = bool(fleet & (set(WIDEBODY) | set(FREIGHT)))
             if operator.long_haul:
                 ideal = min(cap * 0.6, reach * 0.5)
+                if heavy:
+                    low = 200.0
             elif regional:
                 # A regional carrier's legs are its feed: a couple of
                 # hundred miles, not an ocean.
@@ -2983,7 +2986,7 @@ class TrafficInjector:
             elif operator.leisure or operator.charter:
                 cap = min(cap, 1800.0)
                 ideal = 800.0
-            elif fleet & (set(WIDEBODY) | set(FREIGHT)):
+            elif heavy:
                 low = 200.0
                 ideal = min(cap * 0.5, 1600.0)
         # Reach for points across the whole leg, not just the nearest

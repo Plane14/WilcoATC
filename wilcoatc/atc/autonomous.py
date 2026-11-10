@@ -502,6 +502,12 @@ class AutonomousFlight:
             estimated = float(getattr(state, "estimated_cruise_kt", 0.0)
                               or 0.0)
             if 50.0 < estimated < 600.0:
+                # The variable may be true rather than indicated speed;
+                # never command past the model's own red line.
+                redline = float(getattr(state, "barber_pole_kt", 0.0)
+                                or 0.0)
+                if redline > 0:
+                    estimated = min(estimated, redline * 0.95)
                 return estimated
         return self.state.climb_kt or self.performance.cruise_kt
 
@@ -997,9 +1003,13 @@ class AutonomousFlight:
             if agl < 3000 else self.performance.approach_kt)
         # The descent rate is the model's own where it declares one --
         # a clean turbofan comes down at three thousand, a piston at eight
-        # hundred -- and the class figure where it does not.
-        descent_fpm = (float(getattr(state, "typical_descent_fpm", 0.0)
-                             or 0.0) or self.performance.descend_fpm)
+        # hundred -- and the class figure where it does not. The sign is
+        # taken as a magnitude: a negative or absurd report is a model
+        # quirk, not a clearance to climb.
+        descent_fpm = abs(float(getattr(state, "typical_descent_fpm", 0.0)
+                                or 0.0))
+        if not 100.0 <= descent_fpm <= 6000.0:
+            descent_fpm = self.performance.descend_fpm
         self._apply_flight_director(state, altitude=target,
                                     vs_fpm=-descent_fpm,
                                     speed_kt=speed)

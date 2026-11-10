@@ -712,7 +712,11 @@ class RotorcraftFlight:
         if ias > self._profile.max_ias_kt:
             self._send(CYCLIC_LONG_SET, CYCLIC_MAX)   # nose down, UNVERIFIED sign
         torque = float(getattr(state, "eng_torque_pct", 0.0) or 0.0)
-        if torque > 95.0:
+        # The variable is documented as a percent but some models publish
+        # torque in foot-pounds on the same scale; a figure outside the
+        # percent range is not a percent, and limiting on it would hold
+        # the collective down all flight.
+        if 95.0 < torque <= 115.0:
             # At red line the collective comes off, whatever else wants.
             self._collective(max(0.0, self.state.coll_trim - 8.0))
         if agl < 15.0 and not getattr(state, "on_ground", True):
@@ -731,7 +735,9 @@ class RotorcraftFlight:
             state = self.get_state()
         trim = float(getattr(state, "rotor_lateral_trim_pct", 0.0)
                      or 0.0) if state is not None else 0.0
-        if not trim:
+        # Only a value that could be a percent is trusted; anything else
+        # is a unit the conversion did not expect.
+        if not 0.0 < trim < 100.0:
             return 0
         return int(_clamp((trim - 50.0) * 163.84, -3000, 3000))
 
