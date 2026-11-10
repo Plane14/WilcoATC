@@ -107,6 +107,101 @@ CYCLIC_TRIM_HOVER = 0
 THROTTLE_CLIMB = AXIS_MAX
 THROTTLE_CRUISE = int(AXIS_MAX * 0.75)
 
+# --- per-type envelopes ---------------------------------------------------
+# Each rotorcraft is not the same aeroplane: an R44 and an S-76 do not
+# transition at the same speed, climb at the same rate or see the same
+# ceiling. The figures below are derived from the EUROCONTROL ATCPFDB
+# entries for the type (indicative, not operational data) -- cruise TAS
+# for the cruise speed, initial-climb ROC for the climb rate, approach
+# IAS for the approach speed, ceiling and range as published. Where the
+# database's helicopter rows are fixed-wing-looking (the H25x entries
+# publish jet figures) or absent, the code maps to the nearest sane row
+# or keeps the DEFAULT profile. UNVERIFIED like everything else here.
+
+
+@dataclass(frozen=True)
+class HeliProfile:
+    """One rotorcraft's envelope: speeds, rates and the ceiling."""
+
+    ias_cruise_kt: float
+    ias_approach_kt: float
+    climb_vs_fpm: float
+    max_vs_fpm: float
+    max_ias_kt: float
+    ceiling_ft: float
+    transition_kt: float
+    landing_vs_fpm: float
+
+
+def _heli_profile(cruise_tas: float, approach_ias: float, roc_fpm: float,
+                  ceiling_ft: float) -> HeliProfile:
+    """Derive a profile from the database's raw figures, clamped to what
+    a light helicopter envelope looks like."""
+    def clamp(v, lo, hi):
+        return min(hi, max(lo, v))
+
+    cruise = clamp(cruise_tas, 60.0, 140.0)
+    approach = clamp(approach_ias, 45.0, 90.0)
+    climb = clamp(roc_fpm * 0.75, 600.0, 1400.0)
+    return HeliProfile(
+        ias_cruise_kt=cruise,
+        ias_approach_kt=approach,
+        climb_vs_fpm=climb,
+        max_vs_fpm=min(climb * 1.5, 2000.0),
+        max_ias_kt=min(cruise + 30.0, 160.0),
+        ceiling_ft=ceiling_ft,
+        transition_kt=clamp(cruise * 0.4, 30.0, 60.0),
+        landing_vs_fpm=-clamp(roc_fpm * 0.3, 200.0, 400.0))
+
+
+DEFAULT_HELI_PROFILE = HeliProfile(
+    ias_cruise_kt=80.0, ias_approach_kt=60.0, climb_vs_fpm=CLIMB_VS_FPM,
+    max_vs_fpm=MAX_VS_FPM, max_ias_kt=MAX_IAS_KT, ceiling_ft=CRUISE_CAP_FT,
+    transition_kt=TRANSITION_KT, landing_vs_fpm=LANDING_VS_FPM)
+
+# Keyed by the type code the session carries; where WilcoATC's code is not
+# the database's, the row is the nearest equivalent (B430 stands in for
+# the AS350 family, EC35 for the EC130/135/145 family, B412 for the
+# medium twins, AS32 for the Super Puma). UNVERIFIED mappings.
+_HELI_PROFILES: dict[str, HeliProfile] = {
+    # Robinson R44: piston, 110 kt, 1,000 fpm.
+    "R44": _heli_profile(110, 80, 1000, 14000),
+    # Airbus H125 / Leonardo H125 and the AS350 family via Bell 430.
+    "H125": _heli_profile(130, 60, 1400, 14600),
+    "B407": _heli_profile(130, 60, 1400, 14600),
+    "R66": _heli_profile(130, 60, 1400, 14600),
+    # Leonardo H145 / EC145 via the EC135 row.
+    "H145": _heli_profile(135, 90, 1500, 20000),
+    # Airbus H160 has no database row; EC35 is its closest published kin.
+    "H160": _heli_profile(135, 90, 1500, 20000),
+    # Eurocopter EC130/135/145 family.
+    "EC30": _heli_profile(135, 90, 1500, 20000),
+    "EC35": _heli_profile(135, 90, 1500, 20000),
+    "EC45": _heli_profile(135, 90, 1500, 20000),
+    # Airbus AS365 Dauphin via the medium-twin row.
+    "AS50": _heli_profile(125, 60, 1300, 20000),
+    # Bell 206 light single.
+    "B06": _heli_profile(120, 80, 1350, 13500),
+    # Bell 412 / Agusta A139 medium twin.
+    "A139": _heli_profile(125, 60, 1300, 20000),
+    "B412": _heli_profile(125, 60, 1300, 20000),
+    # Sikorsky S-76 medium-lift twin.
+    "S76": _heli_profile(150, 60, 1800, 13800),
+    # Leonardo AW109 light-medium twin.
+    "A109": _heli_profile(140, 100, 1900, 19600),
+    # Airbus AS332 Super Puma heavy twin.
+    "AS32": _heli_profile(140, 90, 1500, 17000),
+    # Bell UH-1 utility single.
+    "UH1": _heli_profile(110, 60, 1755, 19000),
+}
+
+
+def heli_profile_for(type_code: str) -> HeliProfile:
+    """The envelope for this rotorcraft, or the conservative default."""
+    return _HELI_PROFILES.get((type_code or "").strip().upper(),
+                              DEFAULT_HELI_PROFILE)
+
+
 # The internal machine. The owner-visible phase (AutonomousPhase) is a
 # coarser view of the same flight.
 STAGES = ("preflight", "start", "hover", "departure", "climb", "cruise",
@@ -186,6 +281,7 @@ class RotorcraftFlight:
         self.crew = owner.crew
         self.on_event = owner.on_event
         self.state = HeliState()
+        self._profile = DEFAULT_HELI_PROFILE
         self._transitioned_owner = ""
         self._last_tick = 0.0
         # The situation loop runs faster than a pilot's hand can; the
@@ -224,6 +320,10 @@ class RotorcraftFlight:
         """A new leg (or a chained one): everything is re-planned."""
         self.session = session
         self.state = HeliState()
+        # The type's own envelope where the table knows it -- an R44 and
+        # an S-76 do not share a transition speed or a ceiling.
+        self._profile = heli_profile_for(
+            getattr(session.aircraft, "type_code", ""))
         dest = session.destination
         if dest is not None:
             self.state.dest_lat = dest.lat
@@ -231,15 +331,17 @@ class RotorcraftFlight:
             self.state.dest_elev_ft = dest.elev_ft
             self.state.dest_ident = dest.ident
         cruise = session.cruise_altitude_ft or 3000.0
-        self.state.cruise_alt_ft = min(cruise, CRUISE_CAP_FT)
+        self.state.cruise_alt_ft = min(cruise, self._profile.ceiling_ft)
         self.state.pattern_alt_ft = min(
             max(self.state.dest_elev_ft + PATTERN_AGL_FT, 1500.0),
             self.state.cruise_alt_ft)
         speeds = speeds_for(getattr(session.aircraft, "type_code", ""),
                             HELICOPTER)
-        self.state.ias_approach_kt = float(speeds.vapp or 60.0)
-        self.state.ias_cruise_kt = _clamp(
-            self.state.ias_approach_kt + 20.0, 70.0, 110.0)
+        # The model's or the table's approach speed first, the type's own
+        # envelope for the cruise it does not declare.
+        self.state.ias_approach_kt = (
+            float(speeds.vapp or 0.0) or self._profile.ias_approach_kt)
+        self.state.ias_cruise_kt = self._profile.ias_cruise_kt
         self._goto("preflight")
 
     # -- the loop ---------------------------------------------------------
@@ -332,9 +434,9 @@ class RotorcraftFlight:
         if not self.state.systems_sent:
             self.state.systems_sent = True
             if not getattr(state, "battery_master", False):
-                self._send(b"ELECTRICAL_MASTER_BATTERY", 1)
+                self._send(b"MASTER_BATTERY_SET", 1)
             if not getattr(state, "avionics_master", False):
-                self._send(b"AVIONICS_MASTER_SWITCH", 1)
+                self._send(b"AVIONICS_MASTER_SET", 1)
         if not self.state.start_sent:
             self.state.start_sent = True
             # The governor up for the start where the model has one; the
@@ -381,10 +483,11 @@ class RotorcraftFlight:
         then climb out of ground effect."""
         agl = float(getattr(state, "altitude_agl_ft", 0.0) or 0.0)
         ias = float(getattr(state, "indicated_airspeed_kt", 0.0) or 0.0)
+        prof = self._profile
         self._fly(state, agl_target=HOVER_AGL_FT + 20.0,
-                  ias_target=TRANSITION_KT, vs_target=CLIMB_VS_FPM,
-                  throttle=THROTTLE_CLIMB)
-        if agl > 100.0 and ias >= TRANSITION_KT:
+                  ias_target=prof.transition_kt,
+                  vs_target=prof.climb_vs_fpm, throttle=THROTTLE_CLIMB)
+        if agl > 100.0 and ias >= prof.transition_kt:
             self._checklist("after_takeoff")
             self._goto("climb")
         elif self._elapsed() > 90.0:
@@ -397,7 +500,8 @@ class RotorcraftFlight:
         self._fly(state, agl_target=None,
                   alt_target=self.state.cruise_alt_ft,
                   ias_target=self.state.ias_cruise_kt,
-                  vs_target=CLIMB_VS_FPM, throttle=THROTTLE_CLIMB)
+                  vs_target=self._profile.climb_vs_fpm,
+                  throttle=THROTTLE_CLIMB)
         if (state.altitude_ft or 0.0) >= self.state.cruise_alt_ft - 150.0 \
                 and abs(getattr(state, "vertical_speed_fpm", 0.0) or 0.0) < 200:
             self._goto("cruise")
@@ -423,7 +527,8 @@ class RotorcraftFlight:
         self._fly(state, agl_target=None,
                   alt_target=self.state.pattern_alt_ft,
                   ias_target=self.state.ias_approach_kt,
-                  vs_target=-CLIMB_VS_FPM, throttle=THROTTLE_CRUISE)
+                  vs_target=-self._profile.climb_vs_fpm,
+                  throttle=THROTTLE_CRUISE)
         dist = self._distance_nm(state)
         if agl <= PATTERN_AGL_FT and (dist is None or dist < 3.0):
             self._checklist("approach")
@@ -443,7 +548,8 @@ class RotorcraftFlight:
         else:
             self._fly(state, agl_target=0.0,
                       ias_target=max(self.state.ias_approach_kt - 10.0, 40.0),
-                      vs_target=LANDING_VS_FPM, throttle=THROTTLE_CRUISE)
+                      vs_target=self._profile.landing_vs_fpm,
+                      throttle=THROTTLE_CRUISE)
         if agl <= FLARE_AGL_FT + 20.0:
             self._checklist("before_landing")
             self._goto("landing")
@@ -457,13 +563,14 @@ class RotorcraftFlight:
             self._send(CYCLIC_LONG_SET, CYCLIC_TRIM_HOVER)
             self._send(CYCLIC_LAT_SET, 0)
             self._send(STEERING_SET, 0)
-            self._send(b"PARKING_BRAKES", 1)
+            self._send(b"PARKING_BRAKE_SET", 1)
             self._checklist("after_landing")
             self._goto("shutdown")
             return
         # The flare: the rate comes off under FLARE_AGL_FT so the skids
         # meet the ground rather than the airframe meeting it fast.
-        vs_target = LANDING_VS_FPM if agl > FLARE_AGL_FT else -120.0
+        vs_target = (self._profile.landing_vs_fpm if agl > FLARE_AGL_FT
+                     else -120.0)
         self._fly(state, agl_target=0.0,
                   ias_target=max(self.state.ias_approach_kt - 15.0, 35.0),
                   vs_target=vs_target, throttle=THROTTLE_CRUISE)
@@ -488,8 +595,8 @@ class RotorcraftFlight:
         if running and cooled and not self.state.shutdown_sent:
             self.state.shutdown_sent = True
             self._send(ENGINE_STOP, 1)
-            self._send(b"AVIONICS_MASTER_SWITCH", 0)
-            self._send(b"ELECTRICAL_MASTER_BATTERY", 0)
+            self._send(b"AVIONICS_MASTER_SET", 0)
+            self._send(b"MASTER_BATTERY_SET", 0)
             self._emit("info", "Engine shutdown requested (best effort)",
                        "autonomous.rotorcraft.shutdown")
         if (not running and self.state.shutdown_sent) \
@@ -540,7 +647,8 @@ class RotorcraftFlight:
         elif alt_target is not None:
             # Cruise/climb/descent: feet to the level, rate of climb damped.
             err = alt_target - alt
-            want_vs = _clamp(err * 2.0, -MAX_VS_FPM, MAX_VS_FPM)
+            want_vs = _clamp(err * 2.0, -self._profile.max_vs_fpm,
+                             self._profile.max_vs_fpm)
             coll = self.state.coll_trim + COLL_KP_PER_FT * err / 10.0 \
                 + COLL_KD_PER_FPM * (want_vs - vs) / 10.0
         else:
@@ -560,7 +668,7 @@ class RotorcraftFlight:
                                                  CYCLIC_MAX)))
         elif not airborne:
             self._send(CYCLIC_LONG_SET, CYCLIC_TRIM_HOVER)
-        self._send(CYCLIC_LAT_SET, 0)
+        self._send(CYCLIC_LAT_SET, self._lateral_trim_axis(state))
 
         # -- pedals: heading -------------------------------------------------
         want_hdg = self._desired_track(state)
@@ -592,17 +700,40 @@ class RotorcraftFlight:
             self._send(THROTTLE_ALL_FULL, 0)
 
     def _protect(self, state, vs: float, ias: float, agl: float) -> None:
-        """The envelope: never more than MAX_VS either way, never above
-        MAX_IAS, and never a big collective input at skid height."""
-        if vs > MAX_VS_FPM:
+        """The envelope: never more than the type's max VS either way,
+        never above its max IAS, never a big collective at skid height --
+        and never past the torque the engine is rated for, where the
+        model reports it."""
+        max_vs = self._profile.max_vs_fpm
+        if vs > max_vs:
             self._collective(max(0.0, self.state.coll_trim - 10.0))
-        elif vs < -MAX_VS_FPM:
+        elif vs < -max_vs:
             self._collective(min(100.0, self.state.coll_trim + 15.0))
-        if ias > MAX_IAS_KT:
+        if ias > self._profile.max_ias_kt:
             self._send(CYCLIC_LONG_SET, CYCLIC_MAX)   # nose down, UNVERIFIED sign
+        torque = float(getattr(state, "eng_torque_pct", 0.0) or 0.0)
+        if torque > 95.0:
+            # At red line the collective comes off, whatever else wants.
+            self._collective(max(0.0, self.state.coll_trim - 8.0))
         if agl < 15.0 and not getattr(state, "on_ground", True):
             # Effectively landed but not flagged: kill the climb input.
             self._collective(min(self.state.coll_trim, 30.0))
+
+    def _lateral_trim_axis(self, state=None) -> int:
+        """The model's own lateral cyclic trim as an axis value.
+
+        ROTOR LATERAL TRIM PCT is the trim the model carries; 50 is
+        centred, and the departure from it is the bias a wings-level
+        hover needs. UNVERIFIED: the sign and the scale are the
+        simulator's, and a wrong one shows as a slow roll, not a departure.
+        """
+        if state is None:
+            state = self.get_state()
+        trim = float(getattr(state, "rotor_lateral_trim_pct", 0.0)
+                     or 0.0) if state is not None else 0.0
+        if not trim:
+            return 0
+        return int(_clamp((trim - 50.0) * 163.84, -3000, 3000))
 
     # -- navigation ---------------------------------------------------------
 
@@ -626,7 +757,7 @@ class RotorcraftFlight:
         """Feet on the ground, rotor turning: centred controls."""
         self._collective(self.state.coll_trim)
         self._send(CYCLIC_LONG_SET, CYCLIC_TRIM_HOVER)
-        self._send(CYCLIC_LAT_SET, 0)
+        self._send(CYCLIC_LAT_SET, self._lateral_trim_axis(state))
         self._send(STEERING_SET, 0)
 
 

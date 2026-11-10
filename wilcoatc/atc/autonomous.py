@@ -293,6 +293,12 @@ class AutonomousFlight:
         s.vr_kt = float(self._speeds.vr or 0.0)
         s.v2_kt = float(self._speeds.v2 or 0.0)
         s.vapp_kt = float(self._speeds.vapp or 0.0)
+        # The model's own stall speed is a floor under the approach speed:
+        # a table figure below 1.25 times Vs1 is a bug in the table, not a
+        # fast approach.
+        vs1 = float(getattr(state, "design_vs1_kt", 0.0) or 0.0)
+        if vs1 > 0 and (not s.vapp_kt or s.vapp_kt < vs1 * 1.25):
+            s.vapp_kt = vs1 * 1.25
         s.climb_kt = self.performance.climb_kt
         return self._speeds
 
@@ -486,8 +492,18 @@ class AutonomousFlight:
                 or self.session.initial_altitude_ft or 0.0)
 
     def _speed_target(self, state) -> float:
-        return (self.session.assigned_speed_kt
-                or self.state.climb_kt or self.performance.cruise_kt)
+        if self.session.assigned_speed_kt:
+            return self.session.assigned_speed_kt
+        # In the cruise the model's own estimate of its cruise speed is
+        # the best figure there is -- it is this aeroplane's, not a class's
+        # -- and the class number is the fallback for a model that
+        # declares none.
+        if self.state.phase == AutonomousPhase.CRUISE:
+            estimated = float(getattr(state, "estimated_cruise_kt", 0.0)
+                              or 0.0)
+            if 50.0 < estimated < 600.0:
+                return estimated
+        return self.state.climb_kt or self.performance.cruise_kt
 
     def _apply_flight_director(self, state, altitude: float = 0.0,
                              vs_fpm: float = 0.0, heading: float = -1.0,
@@ -565,12 +581,19 @@ class AutonomousFlight:
         d.parking_brake(False)
         err = ((desired_hdg - (state.heading_true or 0.0) + 540.0)
                % 360.0 - 180.0)
-        rudder = max(-0.5, min(0.5, err / 25.0))
+        # The gain is the class's: a heavy needs more nosewheel for the
+        # same error than a light single, and the performance model's turn
+        # rate is the proxy it already carries.
+        divisor = 18.0 if self.performance.turn_rate < fly.RATE_LIGHT \
+            else 28.0
+        rudder = max(-0.5, min(0.5, err / divisor))
         d.rudder(rudder)
-        # Taxi and rollout speeds are throttle jobs, not AP jobs.
+        # Taxi and rollout speeds are throttle jobs, not AP jobs -- and
+        # progressive ones: the further below target, the more asked for.
         gs = state.ground_speed_kt or 0.0
         if gs < target_kt - 2.0:
-            d.throttle(0.18)
+            d.throttle(max(0.05, min(0.6,
+                                     0.10 + (target_kt - gs) * 0.01)))
         elif gs > target_kt + 4.0 and state.on_ground:
             d.throttle(0.0)
 
@@ -599,8 +622,6 @@ class AutonomousFlight:
             # the lights that belong on for the phase.
             if not getattr(state, "transponder_state", -1) in (3, 4):
                 d.transponder(self.session.squawk or "1200")
-            if getattr(state, "transponder_mode", 0) in (0, 1, 2):
-                self._send_event(b"XPNDR_STATE_SET", 3)
             if getattr(state, "kohlsman_hpa", 0.0) > 0 and self.session.altimeter:
                 d.kohlsman(float(self.session.altimeter))
             d.beacon(True)
@@ -849,7 +870,11 @@ class AutonomousFlight:
             # are up. ELEVATOR_SET is proportional, so the FO can fly the
             # rotation the way a pilot does: a firm pull, then hands off.
             elapsed = now - self.state.rotate_at
-            pull = 0.55 if elapsed < 2.5 else 0.35
+            # The pull is the class's too: a light single rotates with
+            # less back pressure than a loaded airliner.
+            pull_scale = (1.0 if self.performance.turn_rate < fly.RATE_LIGHT
+                          else 0.8)
+            pull = (0.55 if elapsed < 2.5 else 0.35) * pull_scale
             d.elevator(pull)
             d.takeoff_power()
             if elapsed > 8.0:
@@ -970,8 +995,13 @@ class AutonomousFlight:
         speed = self.session.assigned_speed_kt or (
             (self.state.vapp_kt or self.performance.approach_kt) + 20.0
             if agl < 3000 else self.performance.approach_kt)
+        # The descent rate is the model's own where it declares one --
+        # a clean turbofan comes down at three thousand, a piston at eight
+        # hundred -- and the class figure where it does not.
+        descent_fpm = (float(getattr(state, "typical_descent_fpm", 0.0)
+                             or 0.0) or self.performance.descend_fpm)
         self._apply_flight_director(state, altitude=target,
-                                    vs_fpm=-self.performance.descend_fpm,
+                                    vs_fpm=-descent_fpm,
                                     speed_kt=speed)
 
         # When the approach phase owns it, or we are close enough that the
@@ -1914,6 +1944,8 @@ class AutonomousFlight:
         """Set error state."""
         self.state.error_message = message
         self.state.error_count += 1
+        log.error("autonomous flight error in %s: %s",
+                  self.state.phase.value, message)
         self._transition(AutonomousPhase.ERROR)
 
     def _emit(self, kind: str, text: str, key: str = "") -> None:
@@ -1923,9 +1955,7 @@ class AutonomousFlight:
     def _ensure_systems_on(self, state) -> None:
         """Ensure battery, avionics, and essential systems are on."""
         if not getattr(state, "battery_master", False):
-            self._send_event(b"ELECTRICAL_MASTER_BATTERY", 1)
-        if not getattr(state, "avionics_master", False):
-            self._send_event(b"AVIONICS_MASTER_SWITCH", 1)
+            self._send_event(b"MASTER_BATTERY_SET", 1)
         self.director.battery(True)
         self.director.avionics(True)
 
@@ -1937,24 +1967,38 @@ class AutonomousFlight:
             self.director.all_starters(True)
 
     def _release_parking_brake(self) -> None:
-        self._send_event(b"PARKING_BRAKES", 0)
+        self._send_event(b"PARKING_BRAKE_SET", 0)
         self.director.parking_brake(False)
 
     def _set_parking_brake(self) -> None:
-        self._send_event(b"PARKING_BRAKES", 1)
+        self._send_event(b"PARKING_BRAKE_SET", 1)
         self.director.parking_brake(True)
 
     def _request_pushback(self) -> None:
-        """Request pushback: the simulator's own, which GSX takes over when
-        it is set to."""
+        """Request pushback through the ramp, then the simulator's own tug."""
+        # The tug cannot move the aeroplane with the parking brake set. The
+        # brake goes back on only after the push has stopped the aircraft.
+        self._release_parking_brake()
+        ground = getattr(self.brain, "ground", None)
+        if ground is not None:
+            try:
+                said = ground.start_pushback()
+            except Exception as e:
+                log.debug("ramp pushback request failed: %s", e)
+            else:
+                if said:
+                    log.info("autonomous pushback: %s", said)
+                    self._emit("info", said, "autonomous.pushback")
+                    return
         if self.sim is not None and getattr(self.sim, "connected", False):
             try:
                 if self.sim.pushback():
+                    log.info("autonomous pushback: simulator tug")
                     return
             except Exception as e:
                 log.debug("simulator pushback failed: %s", e)
-        self.director.pushback()
-        self._send_event(b"TOGGLE_PUSHBACK", 0)
+        if self.director.pushback():
+            log.info("autonomous pushback: director event")
 
     def _request_clearance_via_fo(self) -> None:
         """Request IFR clearance through the first officer."""

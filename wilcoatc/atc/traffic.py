@@ -49,13 +49,14 @@ from .circuit import (CIRCUIT_BASE_NM, CIRCUIT_CENTRELINE_NM,
                       CIRCUIT_UPWIND_NM, CIRCUIT_WIDTH_NM)
 from . import ground as groundwork
 from .flying import (AIRLINER, OWN_DECISIONS, Command, Performance, Target, glide_altitude,
-                     offset_from_track, performance_for)
+                     offset_from_track)
 from .flying import step as fly_step
 from .flying import FLARE_FPM, FLARE_FT, LIFTOFF_AFTER_S
 from .flying import LIGHT as LIGHT_PERFORMANCE
 from .language import phraseology_for, reply_language
-from .operators import (LIGHT_FLEET, Operator, by_icao, registration_prefix,
-                        roster_for)
+from . import perftable
+from .operators import (FREIGHT, LIGHT_FLEET, REGIONAL, WIDEBODY, Operator,
+                        by_icao, registration_prefix, roster_for)
 from .phraseology import Aircraft, Weather, wake_suffix
 from .pilot import PilotSpeech
 
@@ -105,6 +106,11 @@ class Flight:
     runway: str = ""
     destination: str = ""
     origin: str = ""
+    # The aerodromes those names are, where the route was picked from the
+    # navdata rather than the global destination list: the map draws the
+    # route line to these, and the spoken names stay for the radio.
+    destination_icao: str = ""
+    origin_icao: str = ""
     squawk: str = "2000"
     altitude_ft: float = 0.0
     distance_nm: float = 0.0     # arrivals: distance still to run
@@ -2297,7 +2303,17 @@ class TrafficInjector:
         flight.static = False
         flight.arriving = False
         flight.runway = self.field.departure_runway
-        flight.destination = self._elsewhere()
+        if not flight.destination:
+            # A static aeroplane was routed when it was parked; only an
+            # older one without a destination needs one now.
+            if flight.ifr:
+                flight.destination, flight.destination_icao = \
+                    self._route_end(
+                        flight.operator, flight.type_code,
+                        getattr(flight.performance, "range_nm", 0.0) or 0.0)
+            else:
+                flight.destination = (self._nearby_field()
+                                      or self._elsewhere())
         flight.parked_at = 0.0
         flight.next_at = now + self.random.uniform(2.0, 12.0)
         flight.sequence = len(self.traffic_ahead(False)) + 1
@@ -2667,7 +2683,8 @@ class TrafficInjector:
             phase="inbound" if arriving else "clearance",
             next_at=now + self.random.uniform(2.0, 12.0),
             ifr=airline_field,
-            performance=performance_for(type_code, light=operator is None),
+            performance=perftable.traffic_performance(
+                type_code, light=operator is None),
             category=(livemod.CARGO if operator is not None
                       and operator.fleet == livemod.FREIGHT
                       else livemod.AIRLINE if airline_field else livemod.GA),
@@ -2687,6 +2704,12 @@ class TrafficInjector:
             flight.destination = self._nearby_field() or flight.destination
             flight.pattern_direction = (
                 "right" if self.random.random() < 0.2 else "left")
+        elif flight.ifr:
+            # An IFR flight's ends are real aerodromes inside what it can
+            # fly and what its operator flies -- the field at this end, a
+            # navdata airport at the other -- not two names off a list that
+            # had a SkyWest regional jet filed to Warsaw.
+            self._assign_route(flight, arriving)
         if arriving and not flight.ifr:
             # Far enough out to be arriving rather than already in the
             # circuit, close enough that it joins within a few minutes.
@@ -2914,6 +2937,122 @@ class TrafficInjector:
     def _elsewhere(self) -> str:
         """Somewhere plausible to be going to or coming from."""
         return self.random.choice(_DESTINATIONS)
+
+    def _field_airport(self):
+        """This field as a navdata airport, or None."""
+        if not self.field.ident:
+            return None
+        try:
+            return self.navdb.airport(self.field.ident)
+        except Exception:
+            return None
+
+    def _route_end(self, operator: Operator | None, type_code: str,
+                   range_nm: float) -> tuple[str, str]:
+        """The far end of an IFR flight's route: (spoken name, ICAO).
+
+        Chosen from the navdata inside what the aeroplane can fly and what
+        the operator actually flies -- a SkyWest regional jet does not file
+        to Warsaw -- with the airport's scheduled service, size and the
+        operator's own region biasing the draw. Only when the field is
+        somewhere the database has no neighbours does the old global list
+        answer, so a frequency never goes quiet for want of a route.
+        """
+        home = self._field_airport()
+        if home is None or not home.lat:
+            name = self._elsewhere()
+            return name, DESTINATION_AIRPORTS.get(name, "")
+        reach = range_nm if range_nm > 0 else perftable.range_for(type_code)
+        cap = reach * 0.75
+        low = 30.0
+        ideal = cap * 0.45
+        prefixes: tuple[str, ...] = ()
+        regional = False
+        if operator is not None:
+            prefixes = operator.home + operator.region
+            fleet = set(operator.fleet)
+            regional = bool(fleet) and fleet <= set(REGIONAL)
+            if operator.long_haul:
+                ideal = min(cap * 0.6, reach * 0.5)
+            elif regional:
+                # A regional carrier's legs are its feed: a couple of
+                # hundred miles, not an ocean.
+                cap = min(cap, 800.0)
+                ideal = 350.0
+                low = 15.0
+            elif operator.leisure or operator.charter:
+                cap = min(cap, 1800.0)
+                ideal = 800.0
+            elif fleet & (set(WIDEBODY) | set(FREIGHT)):
+                low = 200.0
+                ideal = min(cap * 0.5, 1600.0)
+        # Reach for points across the whole leg, not just the nearest
+        # fields: a widebody's destination is hundreds of miles away, and
+        # a nearest-first query never sees it. Each try picks a bearing
+        # and a distance biased towards the ideal leg, then asks what
+        # scheduled airports are near that point.
+        min_rank = 1 if regional else 2
+        seen: dict[str, object] = {}
+        for _ in range(14):
+            bearing = self.random.uniform(0.0, 360.0)
+            dist = max(low, min(cap, ideal
+                                 + (self.random.random() - 0.5) * cap))
+            lat, lon = project(home.lat, home.lon, bearing, dist)
+            try:
+                near = self.navdb.nearest_airports(
+                    lat, lon, limit=6, max_nm=150.0, min_rank=min_rank,
+                    require_runway=True)
+            except Exception:
+                continue
+            for airport, _d in near:
+                if airport.ident == home.ident or airport.ident in seen:
+                    continue
+                if operator is not None and not airport.scheduled:
+                    continue
+                seen[airport.ident] = airport
+        weighted: list[tuple[float, object]] = []
+        for airport in seen.values():
+            true_dist = haversine_nm(home.lat, home.lon,
+                                     airport.lat, airport.lon)
+            if true_dist < low:
+                continue
+            weight = 1.0 / (1.0 + abs(true_dist - ideal) / max(cap, 1.0))
+            weight *= 0.5 + 0.5 * airport.size_rank
+            if airport.scheduled:
+                weight *= 1.5
+            if prefixes and airport.ident.startswith(prefixes):
+                weight *= 1.4
+            weighted.append((weight, airport))
+        if not weighted:
+            name = self._elsewhere()
+            return name, DESTINATION_AIRPORTS.get(name, "")
+        pick = self.random.choices(
+            [a for _, a in weighted], weights=[w for w, _ in weighted],
+            k=1)[0]
+        return pick.spoken or pick.name, pick.ident
+
+    def _assign_route(self, flight: Flight, arriving: bool) -> None:
+        """Give an IFR flight a plausible origin and destination.
+
+        This field is one end -- the destination of an arrival, the origin
+        of a departure -- and the other is what :meth:`_route_end` picks.
+        The spoken names go on the radio calls; the ICAO pair is what the
+        map's route line is drawn to.
+        """
+        home = self._field_airport()
+        field_name = ((home.spoken or home.name) if home is not None
+                      else self.field.ident or "")
+        field_icao = home.ident if home is not None else ""
+        far_name, far_icao = self._route_end(
+            flight.operator, flight.type_code,
+            getattr(flight.performance, "range_nm", 0.0) or 0.0)
+        if arriving:
+            flight.origin, flight.origin_icao = far_name, far_icao
+            flight.destination, flight.destination_icao = field_name, \
+                field_icao
+        else:
+            flight.origin, flight.origin_icao = field_name, field_icao
+            flight.destination, flight.destination_icao = far_name, far_icao
 
     # ------------------------------------------------------------------
     # running them
@@ -4544,7 +4683,7 @@ class TrafficInjector:
         flight.source = "taken over"
         flight.arriving = True
         flight.runway = self.field.arrival_runway or flight.runway
-        flight.performance = performance_for(
+        flight.performance = perftable.traffic_performance(
             flight.type_code, light=livemod.flight_category(flight)
             == livemod.GA)
         flight.airborne_model = True
@@ -5241,9 +5380,10 @@ class TrafficInjector:
         """
         extra = {
             "origin": flight.origin, "destination": flight.destination,
-            "origin_icao": DESTINATION_AIRPORTS.get(flight.origin, ""),
-            "destination_icao": DESTINATION_AIRPORTS.get(flight.destination,
-                                                         ""),
+            "origin_icao": flight.origin_icao or DESTINATION_AIRPORTS.get(
+                flight.origin, ""),
+            "destination_icao": flight.destination_icao
+            or DESTINATION_AIRPORTS.get(flight.destination, ""),
             "squawk": flight.squawk,
             "make": make_of(flight.type_code),
             "airline": (flight.operator.icao if flight.operator else ""),
@@ -5290,7 +5430,8 @@ class TrafficInjector:
             lat2, lon2 = project(lat, lon, heading, 6.0)
             path.append((lat2, lon2, max(alt, elevation + INITIAL_CLIMB_FT)))
             course = heading
-            target = DESTINATION_AIRPORTS.get(flight.destination)
+            target = (flight.destination_icao
+                      or DESTINATION_AIRPORTS.get(flight.destination))
             airport = self.navdb.airport(target) if target else None
             if airport is not None:
                 course = bearing_deg(lat2, lon2, airport.lat, airport.lon)

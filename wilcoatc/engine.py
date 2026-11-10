@@ -287,14 +287,6 @@ class Engine:
         self.crew.radio_call = self.first_officer_call
         self.crew.transmit = self.first_officer_transmits
 
-        # Autonomous flight (First Officer flying the aircraft)
-        self.autonomous_flight: AutonomousFlight | None = None
-        if self.config.immersion.autonomous_flight:
-            self.autonomous_flight = create_autonomous_flight(
-                self.config, self.navdb, None, None, self.crew, self.brain,
-                lambda: self.state, self.emit, use_route=self.use_route
-            )
-
         # Rules first; the AI layer only sees what they could not classify.
         self.parser = IntentParser()
         self.understanding = Understanding(
@@ -315,6 +307,14 @@ class Engine:
         )
         self.brain.realism = self.config.immersion.controller
         self.brain.hearing = self.config.speech
+        # Autonomous flight (First Officer flying the aircraft). Built after
+        # the brain it talks to; the session arrives with begin_flight.
+        self.autonomous_flight: AutonomousFlight | None = None
+        if self.config.immersion.autonomous_flight:
+            self.autonomous_flight = create_autonomous_flight(
+                self.config, self.navdb, None, None, self.crew, self.brain,
+                lambda: self.state, self.emit, use_route=self.use_route
+            )
         # When the search for an enroute frequency last came up empty, so a
         # flight over a country that publishes none is not made to look for
         # one on every pass of the situation loop.

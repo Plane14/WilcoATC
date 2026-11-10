@@ -101,6 +101,30 @@ class AircraftState:
     # it does not), for the rotate callout.
     design_takeoff_kt: float = 0.0
     min_rotation_kt: float = 0.0
+    # The model's own performance figures, where it declares them (MSFS
+    # "Design Performance" variables, all zero where it does not): speeds
+    # in knots, rates feet a minute, weights pounds, lengths feet. These
+    # are the aeroplane's, not a class's -- the first officer's targets
+    # prefer them over any table.
+    estimated_cruise_kt: float = 0.0
+    typical_descent_fpm: float = 0.0
+    design_vs0_kt: float = 0.0
+    design_vs1_kt: float = 0.0
+    design_vc_kt: float = 0.0
+    min_drag_kt: float = 0.0
+    barber_pole_kt: float = 0.0
+    barber_pole_mach: float = 0.0
+    mach_max_operate: float = 0.0
+    total_weight_lb: float = 0.0
+    max_gross_weight_lb: float = 0.0
+    atc_heavy: bool = False
+    suggested_runway_takeoff_ft: float = 0.0
+    suggested_runway_landing_ft: float = 0.0
+    # Rotorcraft: engine torque, per cent, and the lateral cyclic trim --
+    # the two figures a collective limit and a wings-level hover need.
+    # UNVERIFIED on a running 2024.
+    eng_torque_pct: float = 0.0
+    rotor_lateral_trim_pct: float = 0.0
     # What the first officer's callouts watch (wilcoatc.atc.callouts): the
     # bank, signed degrees, right positive; NAV1's localizer and glideslope
     # and how far off them the needles are (+/-127 and +/-119, full scale);

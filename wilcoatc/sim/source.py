@@ -341,6 +341,37 @@ class SimConnectSource:
         ("TRANSPONDER_STATE:1", "transponder_state", "int", "slow"),
         ("DESIGN_TAKEOFF_SPEED", "design_takeoff_kt", "raw", "slow"),
         ("DESIGN_SPEED_MIN_ROTATION", "min_rotation_kt", "raw", "slow"),
+        # The model's own performance figures (MSFS "Design Performance"
+        # variables). They are the aeroplane's, not a class's: where a
+        # model declares them the first officer's targets come from here,
+        # and where it does not they stay zero and the class stands.
+        # Speeds come back in the wrapper's feet-per-second and are
+        # converted; the rest are already in the unit wanted. UNVERIFIED
+        # on a running 2024: not every add-on publishes them.
+        ("ESTIMATED_CRUISE_SPEED", "estimated_cruise_kt", "fps_kt",
+         "slow"),
+        ("TYPICAL_DESCENT_RATE", "typical_descent_fpm", "raw", "slow"),
+        ("DESIGN_SPEED_VS0", "design_vs0_kt", "fps_kt", "slow"),
+        ("DESIGN_SPEED_VS1", "design_vs1_kt", "fps_kt", "slow"),
+        ("DESIGN_SPEED_VC", "design_vc_kt", "fps_kt", "slow"),
+        ("MIN_DRAG_VELOCITY", "min_drag_kt", "fps_kt", "slow"),
+        ("AIRSPEED_BARBER_POLE", "barber_pole_kt", "raw", "slow"),
+        ("BARBER_POLE_MACH", "barber_pole_mach", "raw", "slow"),
+        ("MACH_MAX_OPERATE", "mach_max_operate", "raw", "slow"),
+        ("TOTAL_WEIGHT", "total_weight_lb", "raw", "slow"),
+        ("MAX_GROSS_WEIGHT", "max_gross_weight_lb", "raw", "slow"),
+        ("ATC_HEAVY", "atc_heavy", "bool", "slow"),
+        ("ATC_SUGGESTED_MIN_RWY_TAKEOFF", "suggested_runway_takeoff_ft",
+         "raw", "slow"),
+        ("ATC_SUGGESTED_MIN_RWY_LANDING", "suggested_runway_landing_ft",
+         "raw", "slow"),
+        # Rotorcraft: torque for the collective limit, lateral trim for
+        # the wings-level hover. "Percent scalar 16K" and "Percent Over
+        # 100" are the kinds _convert's pct rule already knows.
+        # UNVERIFIED on a running 2024.
+        ("ENG_TORQUE_PERCENT:1", "eng_torque_pct", "pct", "slow"),
+        ("ROTOR_LATERAL_TRIM_PCT", "rotor_lateral_trim_pct", "pct",
+         "slow"),
         # The callouts. The bank every read, because "bank" is about a
         # moment; the needles and the selected speed in the rotation, a
         # needle coming alive being worth a second or two of lag.
@@ -672,6 +703,8 @@ class SimConnectSource:
 
     def _fetch(self, name: str, attribute: str, kind: str) -> bool:
         """Read one variable and keep it. True if a value came back."""
+        if name in self._missing:
+            return False
         raw = self._get(name)
         if raw is None:
             # Only a variable that has never answered, and only while the
@@ -719,6 +752,10 @@ class SimConnectSource:
             # unit; anything over 100 can only be that scale.
             value = float(raw)
             return value / 163.84 if value > 100.0 else value
+        if kind == "fps_kt":
+            # The design-performance speeds are asked for in the
+            # wrapper's native feet per second.
+            return float(raw) * 1.94384449
         return float(raw)
 
     @staticmethod

@@ -100,6 +100,11 @@ class Performance:
     braking_kt_s: float = 4.5
     # What it climbs to before anybody has said otherwise.
     pattern_agl_ft: float = 1500.0
+    # Still-air range and service ceiling, where the type's figures are
+    # known (atc/perftable.py); zero means "the table does not say", and
+    # callers must not read zero as "cannot fly".
+    range_nm: float = 0.0
+    ceiling_ft: float = 0.0
 
 
 AIRLINER = Performance()

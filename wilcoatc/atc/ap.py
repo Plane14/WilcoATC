@@ -198,7 +198,7 @@ class FlightDirector:
         return self.send(b"AP_AIRSPEED_ON" if on else b"AP_AIRSPEED_OFF", 0)
 
     def mach_hold(self, on: bool = True) -> bool:
-        return self.send(b"AP_MACH_HOLD_ON" if on else b"AP_MACH_HOLD_OFF", 0)
+        return self.send(b"AP_MACH_ON" if on else b"AP_MACH_OFF", 0)
 
     # -- approach ----------------------------------------------------------
 
@@ -218,9 +218,7 @@ class FlightDirector:
     def go_around(self) -> bool:
         """The TO/GA press itself, where the model has the switch: the
         autopilot's go-around mode and the autothrottle's, together."""
-        ok = self.send(b"AUTOPILOT_TO_GA", 0)
-        self.send(b"AUTO_THROTTLE_TO_GA", 0)
-        return ok
+        return self.send(b"AUTO_THROTTLE_TO_GA", 0)
 
     def throttle(self, position: float) -> bool:
         """The thrust levers, 0..1 of travel: 0 idle, 1 takeoff. The
@@ -234,7 +232,7 @@ class FlightDirector:
         return self.send(b"AXIS_THROTTLE_SET", int(round(position * AXIS_MAX)))
 
     def throttle_idle(self) -> bool:
-        return self.send(b"THROTTLE_IDLE", 0)
+        return self.throttle(0.0)
 
     def throttle_cut(self) -> bool:
         return self.send(b"THROTTLE_CUT", 0)
@@ -255,7 +253,7 @@ class FlightDirector:
     def rudder(self, position: float) -> bool:
         """-1 full left .. +1 full right; ignored where gyro controls
         are enabled, which is the pilot's own business then."""
-        return self.send(b"RUDDER_SET", _axis(position))
+        return self.send(b"AXIS_RUDDER_SET", _axis(position))
 
     def center_controls(self) -> bool:
         ok = self.send(b"CENTER_AILER_RUDDER", 0)
@@ -284,8 +282,7 @@ class FlightDirector:
     # -- ground --------------------------------------------------------------
 
     def parking_brake(self, on: bool) -> bool:
-        name = b"PARKING_BRAKES_ON" if on else b"PARKING_BRAKES_OFF"
-        return self.send(name, 0)
+        return self.send(b"PARKING_BRAKE_SET", 1 if on else 0)
 
     def pushback(self) -> bool:
         return self.send(b"TOGGLE_PUSHBACK", 0)
