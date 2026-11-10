@@ -1076,15 +1076,20 @@ the checklist ends "...complete, one item open". No answer gets the item once
 more, then "holding the checklist".
 
 The checklists depend on what you're flying and how. The class — piston single
-or twin, turboprop single or twin, business jet, airliner — comes from what the
-simulator says about the model first (a turbine conversion filed as a C172 is
-a turboprop), then from the ICAO type; a helicopter has callouts only, for
-now. An IFR flight gets the clearance, the navigation source, the approach
-briefing and the minimums; a VFR flight the VFR squawk, the circuit height and
-the next field's frequency. The light aeroplanes' checklists are in English
-and French, the others in English, as their operators' are. They come from the
-Cessna 172S, Diamond, TBM, King Air, Citation and A320/737 checklists and the
-FAA Airplane Flying Handbook; each file says which.
+or twin, turboprop single or twin, business jet, airliner, helicopter — comes
+from what the simulator says about the model first (a turbine conversion filed
+as a C172 is a turboprop), then from the ICAO type. A helicopter gets the same
+eleven checklists, distilled from the rotary profiles on flightchecklist.app
+(H125, Bell 407, EC135, UH-1H): preflight, start, the hover checks, before
+takeoff, the transition, cruise, descent, approach, before landing and
+shutdown, with rotor RPM, the rotor brake and the collective checked where
+the model publishes them. An IFR flight gets the clearance, the navigation
+source, the approach briefing and the minimums; a VFR flight the VFR squawk,
+the circuit height and the next field's frequency. The light aeroplanes' and
+the helicopter's checklists are in English and French, the others in English,
+as their operators' are. They come from the Cessna 172S, Diamond, TBM, King
+Air, Citation, A320/737 checklists, the FAA Airplane Flying Handbook and the
+rotary profiles; each file says which.
 
 **Your own aeroplane.** Put `C172.json` (the ICAO type) in a `checklists`
 folder beside `config.yaml`, or `piston_single.json` for a whole class. It
@@ -1122,8 +1127,13 @@ tower has actually said — and "runway vacated"; 50/30/10 in the flare with
 `immersion.first_officer.flare_callouts`. And on any flight, once and then not
 for thirty seconds: "speed" (ten knots off the approach speed), "sink rate"
 and "bank" below a thousand feet, "altitude" (three hundred feet off a level
-you had reached). A turboprop twin or a jet calls in English whatever the crew
-speak, as its operator's SOP does; a light aeroplane in the crew's language.
+you had reached). A helicopter gets none of the takeoff calls — there is no
+rotation and no V-speeds — but "rotors at flight RPM" as the main rotor
+spools up, "airborne" leaving the ground, the thousand and the five hundred
+on the way down, the circuit, and the deviations; its approach-speed call
+uses the type's own figure (`vspeeds.py`). A turboprop twin or a jet calls
+in English whatever the crew speak, as its operator's SOP does; a light
+aeroplane in the crew's language.
 
 A callout the radio held back isn't said late: past `callout_late_s` (3 s)
 it's dropped, and `logs crew` says so.
@@ -1189,6 +1199,24 @@ simulator's. Their files, in `wilcoatc/atc/checklists/types/`, are matched on
 the simulator's title and leave everything but the gear and flaps unchecked;
 every disagreement the first officer does see is a `mismatch` line in `logs
 crew`, with the aircraft's title, so the list can grow.
+
+**Autonomous flight in a helicopter.** `immersion.autonomous_flight` flies a
+rotorcraft too, through its own controller (`wilcoatc/atc/autonomous_heli.py`)
+rather than the aeroplane's: engine start on a best-effort basis (the
+generic start event plus the rotor governor where the model answers it —
+MSFS has no universal helicopter start), a hover check, the transition at
+about 40 kt, a climb, cruise direct to the destination, an approach down to
+a hover, and a landing with a cool-down and rotor brake where fitted. The
+cyclic, collective and pedals are flown closed-loop from the state —
+collective against height and sink rate, cyclic against airspeed, pedals
+against heading — inside conservative limits. **VFR only**: an IFR session
+is flown VFR with an `autonomous.rotorcraft.vfr_only` event, because there
+are no helicopter instrument procedures in the navdata; chained flights
+accept heliports and file VFR legs. Everything about it — the event names,
+the gains, which add-ons publish which variables — is UNVERIFIED until it
+has been flown in a running sim; where the model does not answer, the
+controller degrades to timeouts and `autonomous.*` events rather than
+fighting the aircraft.
 
 ### Your own recordings 🎙️
 

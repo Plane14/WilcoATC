@@ -130,6 +130,11 @@ class AutonomousFlight:
 
         self.state = AutonomousState()
         self._enabled = config.immersion.autonomous_flight
+        # The rotorcraft controller, when the aeroplane in the sim is a
+        # helicopter: it flies the whole leg itself and this class only
+        # delegates (wilcoatc.atc.autonomous_heli).
+        self._heli = None
+        self._is_helicopter = False
         self._chained = config.immersion.autonomous_chained_flights
         self._ap_mode = config.immersion.autonomous_ap_mode
         self._chain_delay = config.immersion.autonomous_chain_delay_s
@@ -203,11 +208,35 @@ class AutonomousFlight:
                 range_nm = 2000
             elif found in (ac.TURBOPROP_SINGLE, ac.TURBOPROP_TWIN):
                 range_nm = 1000
+            elif found == ac.HELICOPTER:
+                range_nm = 250
             else:
                 range_nm = 500
 
         self.state.aircraft_range_nm = range_nm
         log.info("Aircraft %s: estimated range %d NM", type_code, range_nm)
+
+    def _detect_helicopter(self, session: FlightSession) -> bool:
+        """Whether the aeroplane in the sim is a helicopter.
+
+        The simulator's own classification first (CATEGORY / ENGINE TYPE /
+        the Doc 8643 designator); the pilot's helicopter profile as the
+        fallback for a session begun before the state has answered.
+        """
+        from . import aircraft_class as ac
+
+        try:
+            state = self.get_state()
+        except Exception:
+            state = None
+        if state is not None and getattr(state, "connected", False):
+            return ac.of_state(state).name == ac.HELICOPTER
+        if getattr(session.profile, "kind", "") == "helicopter":
+            return True
+        return ac.classify(
+            getattr(session.aircraft, "type_code", ""),
+            airline=getattr(session.profile, "airliner", False)
+        ).name == ac.HELICOPTER
 
     @property
     def enabled(self) -> bool:
@@ -229,6 +258,12 @@ class AutonomousFlight:
         self.state.phase_entered_at = time.monotonic()
         # Compute aircraft performance for chain planning
         self._compute_aircraft_performance(session)
+        self._is_helicopter = self._detect_helicopter(session)
+        if self._is_helicopter:
+            from .autonomous_heli import RotorcraftFlight
+
+            self._heli = RotorcraftFlight(self)
+            self._heli.begin(session)
         self._emit("info", "Autonomous flight started", "autonomous.started")
 
     def set_chain_flights(self, flights: list[dict]) -> None:
@@ -243,6 +278,14 @@ class AutonomousFlight:
 
         state = self.get_state()
         if state is None or not state.connected:
+            return
+
+        # A helicopter is flown by its own controller, on every pass of the
+        # loop rather than the fixed-wing action interval: the cyclic,
+        # collective and pedals are closed-loop controls, not once-a-second
+        # mode selections.
+        if self._heli is not None:
+            self._heli.tick(state)
             return
 
         now = time.monotonic()
@@ -609,6 +652,12 @@ class AutonomousFlight:
         """Check if airport can handle the aircraft type."""
         type_code = self.state.aircraft_type
 
+        # A helicopter needs a place to set down, not a runway: a heliport
+        # or any strip will do, and the smallest ones are the norm.
+        if self._is_helicopter:
+            return airport.type in ("heliport", "small_airport",
+                                    "medium_airport", "large_airport")
+
         # Check runway length
         min_length = self._min_runway_length_for_type(type_code)
         has_long_runway = any(
@@ -631,6 +680,9 @@ class AutonomousFlight:
         """Check if airport has ground services (fuel, parking, handling)."""
         # In the sim, most airports with runways have basic services
         # Check for FBO/fuel availability via airport type
+        if self._is_helicopter:
+            return airport.type in ("heliport", "small_airport",
+                                    "medium_airport", "large_airport")
         if airport.type in ("large_airport", "medium_airport"):
             return True
         # Small airports might work for light aircraft
@@ -700,7 +752,12 @@ class AutonomousFlight:
             cruise_ft = 39000
 
         # Adjust for aircraft type
-        if self.state.aircraft_type in ("C152", "C172", "C182", "PA28", "DA40", "SR22"):
+        if self._is_helicopter:
+            # A rotorcraft leg is VFR and low: no helicopter instrument
+            # procedures exist in the navdata, and a light single does not
+            # cruise at flight-level heights.
+            cruise_ft = min(cruise_ft, 5000)
+        elif self.state.aircraft_type in ("C152", "C172", "C182", "PA28", "DA40", "SR22"):
             cruise_ft = min(cruise_ft, 12000)
         elif self.state.aircraft_type in ("TBM9", "PC12", "C25A", "C25C", "AT76", "DH8D"):
             cruise_ft = min(cruise_ft, 28000)
@@ -712,7 +769,7 @@ class AutonomousFlight:
             "destination_name": destination.name,
             "distance_nm": round(distance),
             "cruise_altitude_ft": cruise_ft,
-            "ifr": True,  # Default to IFR for autonomous
+            "ifr": not self._is_helicopter,  # rotorcraft legs are VFR
             "aircraft_type": self.state.aircraft_type,
         }
 

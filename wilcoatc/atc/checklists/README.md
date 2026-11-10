@@ -17,8 +17,21 @@ One file per class of aeroplane ships here:
 | `turboprop_twin.json` | King Air, ATR, Dash 8... |
 | `business_jet.json` | Citation, Phenom, Learjet, Vision Jet... |
 | `airliner.json` | A320, 737, 777, E-Jets, CRJ... |
+| `helicopter.json` | H125, EC135, Bell 407, UH-1H, Robinson... |
 
-Helicopters get callouts only, no checklists, for now.
+Helicopters get the same eleven checklists, but a thinner set of them: a
+rotorcraft's systems are fewer, and the flows are distilled from the
+rotary profiles on flightchecklist.app (H125, Bell 407, EC135, UH-1H)
+rather than from a flight manual each. Where the simulator publishes a
+variable the item is checked against it; where it does not -- most
+helicopter systems -- the answer is taken on trust, and the item's
+`note` says so. The rotorcraft variables are listed at the bottom.
+
+`types/` also carries a file per known rotary add-on title (the Asobo
+H125 and EC135 family, the Nemeth Bell 407/427/505, Taog's UH-1H). They
+only carry `match` and `no_check`: until a `logs crew` `mismatch` line
+shows what an add-on actually publishes, the checks on the rotorcraft
+variables are off for it.
 
 The class comes from the simulator first (its engine type and number of
 engines), then from the type's ICAO designator; `logs crew` says which.
@@ -130,6 +143,13 @@ The variables are the fields of the program's aircraft state
 | `autopilot`, `gps_drives_nav1`, `pitot_heat`, `spoilers_armed` | on or off |
 | `avionics_master`, `battery_master`, `seatbelt_sign`, `engines_running` | on or off |
 | `com1_active`, `com1_standby`, `com2_active`, `com2_standby` | megahertz |
+| `collective_position`, `tail_rotor_pedal_position` | the levers, per cent |
+| `rotor_rpm_pct`, `rotor_gov_target_pct` | main rotor per cent of rated RPM; the governor's target |
+| `num_main_rotors`, `rotor_clutch_active`, `rotor_brake_active`, `rotor_brake_handle_pos`, `rotor_brake_available` | the rotor installation and its brake and clutch |
+
+The last five rows are the MSFS helicopter variables, UNVERIFIED on a
+running 2024 and missing on models that do not publish them; a value that
+never arrives simply never checks anything.
 
 A variable that is not in the state is reported as a problem and the item
 is read without a check.

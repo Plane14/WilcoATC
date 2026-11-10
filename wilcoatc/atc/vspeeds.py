@@ -105,6 +105,19 @@ TABLE: dict[str, Speeds] = {
                "data, and not today's weight",
         unverified=True),
 }
+# The rotary entries: no rotation speed -- vr stays 0 -- but an approach
+# speed, for the "speed" deviation call on the circuit. All UNVERIFIED:
+# each type's POH figure at a typical weight, and the light singles'
+# "normal approach" ranges.
+for _code, _vapp in {
+        "R22": 55, "CBRI": 60, "R44": 65, "R66": 70, "AS50": 65,
+        "EC30": 60, "B06": 55, "B407": 70, "EC35": 65, "EC45": 75,
+        "H125": 65, "H145": 75, "H160": 80, "S76": 80, "A109": 70,
+        "A139": 75, "B412": 75}.items():
+    TABLE[_code] = _u(0, f"a helicopter's approach speed (~{_vapp} kt)",
+                      vapp=float(_vapp))
+del _code, _vapp
+
 TABLE["P28A"] = TABLE["PA28"]
 TABLE["TBM8"] = TABLE["TBM7"] = replace(TABLE["TBM9"], unverified=True,
                                         source="UNVERIFIED: as the TBM 930")
@@ -131,7 +144,7 @@ CLASS_FIGURES: dict[str, Speeds] = {
     TURBOPROP_TWIN: _u(105, "a twin turboprop's rotation speed"),
     BUSINESS_JET: _u(110, "a business jet's rotation speed"),
     AIRLINER: _u(140, "an airliner's rotation speed"),
-    HELICOPTER: _u(0, "a helicopter does not rotate"),
+    HELICOPTER: _u(0, "a helicopter does not rotate", vapp=65),
 }
 
 

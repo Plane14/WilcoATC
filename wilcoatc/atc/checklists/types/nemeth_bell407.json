@@ -1,0 +1,23 @@
+{
+  "_comment": "UNVERIFIED: matched on the simulator's title by these fragments (Nemeth Designs' Bell 407/427/505 titles carry the model name). The rotorcraft variables this program reads are the generic MSFS helicopter variables; whether the add-on publishes them is not measured. Until it is, the checks on them are off for this model; a pilot's own file may check them again.",
+  "source": "Nemeth Designs Bell 407/427/505: no measurement; UNVERIFIED as above.",
+  "match": [
+    "bell 407",
+    "bell 427",
+    "bell 505",
+    "bell407",
+    "bell427",
+    "bell505"
+  ],
+  "no_check": [
+    "collective_position",
+    "rotor_rpm_pct",
+    "num_main_rotors",
+    "tail_rotor_pedal_position",
+    "rotor_brake_active",
+    "rotor_brake_handle_pos",
+    "rotor_brake_available",
+    "rotor_clutch_active",
+    "rotor_gov_target_pct"
+  ]
+}

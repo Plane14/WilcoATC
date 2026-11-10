@@ -2211,6 +2211,8 @@ CALLOUT_WORDS: dict[str, dict[str, str]] = {
         "v_two": "V two.",
         "positive_rate": "Positive rate.",
         "gear_up": "Gear up.",
+        "rotor_rpm": "Rotors at flight RPM.",
+        "airborne": "Airborne.",
         "five_hundred_up": "Five hundred feet.",
         "thousand_to_go": "One thousand to go.",
         "localizer_alive": "Localizer alive.",
@@ -2245,6 +2247,8 @@ CALLOUT_WORDS: dict[str, dict[str, str]] = {
         "v_two": "V deux.",
         "positive_rate": "Vario positif.",
         "gear_up": "Train rentré.",
+        "rotor_rpm": "Rotor au régime de vol.",
+        "airborne": "En l'air.",
         "five_hundred_up": "Cinq cents pieds.",
         "thousand_to_go": "Mille avant le niveau.",
         "localizer_alive": "Localizer actif.",
@@ -2279,6 +2283,8 @@ CALLOUT_WORDS: dict[str, dict[str, str]] = {
         "v_two": "V zwei.",
         "positive_rate": "Positive Steigrate.",
         "gear_up": "Fahrwerk eingefahren.",
+        "rotor_rpm": "Rotor auf Flugdrehzahl.",
+        "airborne": "In der Luft.",
         "five_hundred_up": "Fünfhundert Fuß.",
         "thousand_to_go": "Noch tausend.",
         "localizer_alive": "Localizer lebt.",
@@ -2314,6 +2320,8 @@ CALLOUT_WORDS: dict[str, dict[str, str]] = {
         "v_two": "V twee.",
         "positive_rate": "Positief stijgen.",
         "gear_up": "Wielen op.",
+        "rotor_rpm": "Rotor op vliegsnelheid.",
+        "airborne": "In de lucht.",
         "five_hundred_up": "Vijfhonderd voet.",
         "thousand_to_go": "Nog duizend.",
         "localizer_alive": "Localizer actief.",
@@ -2347,6 +2355,7 @@ CALLOUT_NEEDS: dict[str, str] = {
     "airspeed_alive": "rolling", "eighty": "rolling",
     "one_hundred": "rolling", "v_one": "rolling", "rotate": "rolling",
     "positive_rate": "airborne", "v_two": "airborne", "gear_up": "gear_up",
+    "airborne": "airborne",
 }
 
 # The deviation calls, which may be made again (callouts.DEVIATION_EVERY_S).

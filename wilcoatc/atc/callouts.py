@@ -27,7 +27,11 @@ the type's first letters. Callouts belong to the class and to the rules:
   thousand feet), "altitude" (three hundred feet off a level that had been
   reached). Each once, then not again for :data:`DEVIATION_EVERY_S`.
 
-A helicopter gets the deviations and the IFR heights, none of the takeoff.
+* **A helicopter**: none of the takeoff calls -- there is no rotation and
+  no V-speeds -- but "rotors at flight RPM" as the main rotor spools up,
+  "airborne" leaving the ground, the thousand and the five hundred on the
+  way down like a turboprop's, the circuit, and the deviations. The IFR
+  heights still apply to a helicopter flown on instruments.
 
 Nothing here speaks. :meth:`Callouts.watch` returns the cues due, and the
 crew say them -- after the radio, never over it, and not at all once the
@@ -63,6 +67,11 @@ ONE_THOUSAND_FT = 1000.0
 THOUSAND_TO_GO_FT = 1000.0
 # A needle off its stop: the CDI's full scale is 127, the glideslope's 119.
 NEEDLE_ALIVE = 100.0
+# The main rotor's per cent of rated RPM at which the first officer calls
+# it at flight RPM: UNVERIFIED, the governed range's lower end on the
+# profiles flightchecklist.app carries. A model that does not publish
+# ROTOR RPM PCT never calls it.
+ROTOR_RPM_CALL = 85.0
 # Minimums with none stated: a CAT I decision height. UNVERIFIED as the
 # day's: it is the commonest, not the pilot's.
 DEFAULT_MINIMUMS_FT = 200.0
@@ -156,7 +165,7 @@ class Callouts:
                     "five_hundred", "approaching_minimums", "minimums",
                     "localizer_alive", "glideslope_alive", "five_hundred_up",
                     "final_cleared", "final_not_cleared", "fifty", "thirty",
-                    "ten", "v_two"):
+                    "ten", "v_two", "airborne"):
             self._said.discard(cue)
         self._rate_armed = True
         self._lowest = 1e9
@@ -184,7 +193,9 @@ class Callouts:
         if not previous.on_ground and state.on_ground:
             self._landed = True
 
-        if cls != HELICOPTER:
+        if cls == HELICOPTER:
+            out += self._rotorcraft(previous, state, situation)
+        else:
             out += self._takeoff(previous, state, situation)
         out += self._climb(previous, state, situation)
         out += self._approach(previous, state, situation)
@@ -232,6 +243,26 @@ class Callouts:
                 and speeds.v2 and "v_one" in self._said \
                 and _crossed_up(before, now, speeds.v2):
             out += self._once("v_two", why=speeds.source)
+        return out
+
+    # -- the rotorcraft -------------------------------------------------
+
+    def _rotorcraft(self, previous, state, s: Situation) -> list[Call]:
+        """The helicopter's own calls: the rotor spooling up, and leaving
+        the ground. ``s`` is unused: a helicopter has no takeoff calls."""
+        out: list[Call] = []
+        rpm_now = float(getattr(state, "rotor_rpm_pct", 0.0) or 0.0)
+        if rpm_now > 0:
+            # Below this the rotor is winding down for the shutdown, so the
+            # next start calls it again.
+            if rpm_now < 30.0:
+                self._said.discard("rotor_rpm")
+            elif float(getattr(previous, "rotor_rpm_pct", 0.0) or 0.0) \
+                    < ROTOR_RPM_CALL <= rpm_now:
+                out += self._once("rotor_rpm",
+                                  why="main rotor at flight RPM")
+        if previous.on_ground and not state.on_ground:
+            out += self._once("airborne", why="off the ground")
         return out
 
     # -- the climb ----------------------------------------------------------
@@ -307,7 +338,8 @@ class Callouts:
         if not descending:
             return out
         before, now = self._height(previous), self._height(state)
-        if s.aircraft_class in HEAVY or s.rules == "ifr":
+        if s.aircraft_class in HEAVY or s.aircraft_class == HELICOPTER \
+                or s.rules == "ifr":
             if _crossed_down(before, now, ONE_THOUSAND_FT):
                 out += self._once("one_thousand")
             if _crossed_down(before, now, FIVE_HUNDRED_FT):

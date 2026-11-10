@@ -1,0 +1,23 @@
+{
+  "_comment": "UNVERIFIED: matched on the simulator's title by these fragments (the Asobo light twin helicopter titles carry EC135/EC145). The rotorcraft variables this program reads are the generic MSFS helicopter variables; whether the add-on publishes them is not measured. Until it is, the checks on them are off for this model; a pilot's own file may check them again.",
+  "source": "Asobo Airbus EC135/EC145 (H135/H145 family titles): no measurement; UNVERIFIED as above.",
+  "match": [
+    "ec135",
+    "ec145",
+    "h135",
+    "h145",
+    "airbus ec135",
+    "airbus ec145"
+  ],
+  "no_check": [
+    "collective_position",
+    "rotor_rpm_pct",
+    "num_main_rotors",
+    "tail_rotor_pedal_position",
+    "rotor_brake_active",
+    "rotor_brake_handle_pos",
+    "rotor_brake_available",
+    "rotor_clutch_active",
+    "rotor_gov_target_pct"
+  ]
+}

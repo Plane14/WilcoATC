@@ -355,6 +355,22 @@ class SimConnectSource:
         ("FUEL_LEFT_QUANTITY", "fuel_left_gal", "raw", "slow"),     # Gallons
         ("FUEL_RIGHT_QUANTITY", "fuel_right_gal", "raw", "slow"),   # Gallons
         ("FUEL_TOTAL_QUANTITY_WEIGHT", "fuel_total_lb", "raw", "slow"),  # lb
+        # The helicopter's own instruments (MSFS 2024 Helicopter
+        # Variables). Slow like the rest of the configuration: the
+        # autonomous rotorcraft controller reads them on demand
+        # (read_now), and a checklist check can wait a few seconds.
+        # Most are the wrapper's own HelicopterSpecificData entries;
+        # OUR_VARIABLES adds the four it does not have.
+        ("COLLECTIVE_POSITION", "collective_position", "pct", "slow"),
+        ("ROTOR_RPM_PCT", "rotor_rpm_pct", "pct", "slow"),
+        ("NUM_OF_MAIN_ROTORS", "num_main_rotors", "int", "slow"),
+        ("TAIL_ROTOR_PEDAL_POSITION", "tail_rotor_pedal_position", "pct",
+         "slow"),
+        ("ROTOR_BRAKE_ACTIVE", "rotor_brake_active", "bool", "slow"),
+        ("ROTOR_BRAKE_HANDLE_POS", "rotor_brake_handle_pos", "pct", "slow"),
+        ("ROTOR_BRAKE_AVAILABLE", "rotor_brake_available", "bool", "slow"),
+        ("ROTOR_CLUTCH_ACTIVE", "rotor_clutch_active", "bool", "slow"),
+        ("ROTOR_GOV_TARGET_PCT:1", "rotor_gov_target_pct", "pct", "slow"),
         ("AMBIENT_WIND_DIRECTION", "ambient_wind_direction", "deg", "slow"),
         ("AMBIENT_WIND_VELOCITY", "ambient_wind_velocity", "raw", "slow"),  # Knots
         ("AMBIENT_TEMPERATURE", "ambient_temperature_c", "raw", "slow"),    # Celsius
@@ -495,6 +511,23 @@ class SimConnectSource:
         "DESIGN_SPEED_MIN_ROTATION": [
             "The model's minimum rotation speed",
             b"DESIGN SPEED MIN ROTATION", b"Knots", "N"],
+        # The MSFS 2024 helicopter variables (SDK "Helicopter
+        # Variables") the wrapper's own HelicopterSpecificData does not
+        # have. Percent-over-100 natively, asked for as Percent and
+        # renormalised in _convert all the same. UNVERIFIED on a
+        # running 2024.
+        "NUM_OF_MAIN_ROTORS": [
+            "How many main rotors the helicopter has",
+            b"NUM OF MAIN ROTORS", b"Number", "N"],
+        "TAIL_ROTOR_PEDAL_POSITION": [
+            "The tail rotor pedals, per cent",
+            b"TAIL ROTOR PEDAL POSITION", b"Percent", "N"],
+        "ROTOR_BRAKE_AVAILABLE": [
+            "Whether the model has a rotor brake",
+            b"ROTOR BRAKE AVAILABLE", b"Bool", "N"],
+        "ROTOR_GOV_TARGET_PCT:index": [
+            "The governor's target RPM, per cent of nominal",
+            b"ROTOR GOV TARGET PCT:index", b"Percent", "N"],
     }
 
     @classmethod
@@ -673,6 +706,12 @@ class SimConnectSource:
             return math.degrees(float(raw))
         if kind == "deg":
             return normalize_angle(float(raw), source_is_radians=False)
+        if kind == "pct":
+            # Percent-over-100 variables can come back on the 0-16384
+            # scale when a wrapper or a version ignores the requested
+            # unit; anything over 100 can only be that scale.
+            value = float(raw)
+            return value / 163.84 if value > 100.0 else value
         return float(raw)
 
     @staticmethod

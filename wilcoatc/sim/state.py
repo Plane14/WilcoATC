@@ -118,6 +118,22 @@ class AircraftState:
     fuel_left_gal: float = 0.0
     fuel_right_gal: float = 0.0
     fuel_total_lb: float = 0.0
+    # What a helicopter's instruments say (MSFS 2024 "Helicopter
+    # Variables"): the collective lever, per cent depressed; the main
+    # rotor's per cent of rated RPM; how many main rotors the model has;
+    # the tail rotor pedals, per cent; the rotor brake and clutch; and
+    # the governor's target, per cent of nominal RPM. UNVERIFIED on a
+    # running 2024: the percent-over-100 scaling and which add-ons
+    # publish them at all.
+    collective_position: float = 0.0
+    rotor_rpm_pct: float = 0.0
+    num_main_rotors: int = 0
+    tail_rotor_pedal_position: float = 0.0
+    rotor_brake_active: bool = False
+    rotor_brake_handle_pos: float = 0.0
+    rotor_brake_available: bool = False
+    rotor_clutch_active: bool = False
+    rotor_gov_target_pct: float = 0.0
 
     # --- ambient conditions the sim is actually rendering ---
     ambient_wind_direction: float = 0.0

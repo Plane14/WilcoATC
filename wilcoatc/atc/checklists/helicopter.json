@@ -1,0 +1,128 @@
+{
+  "_comment": "The class flows for a helicopter. A type that differs (a twin, a run-up, a specific start sequence) is a file of your own or one of types/: see README.md.",
+  "source": "The rotary profiles of flightchecklist.app/msfs (Airbus H125 / CowanSim, Bell 407 / Nemeth Designs, Eurocopter EC135 T1 / Asobo, Bell UH-1H / Taog's Hangar), which follow each model's flight manual: the items all four have, worded as they are. Where a sim variable exists the item is checked; where it does not the answer is taken on trust.",
+  "checklists": {
+    "before_start": {
+      "title": {"en": "before start", "fr": "avant mise en route"},
+      "items": [
+        {"challenge": {"en": "Preflight inspection", "fr": "Visite pré-vol"}, "response": {"en": "complete", "fr": "effectuée"}, "accept": ["complete", "check"], "note": "Walk-around, fuel and oil levels, rotor blades: the model's exterior check."},
+        {"challenge": {"en": "Weight and balance", "fr": "Masse et centrage"}, "response": {"en": "within limits", "fr": "dans les limites"}, "accept": ["check", "value"]},
+        {"challenge": {"en": "Performance and height-velocity diagram", "fr": "Performances et diagramme hauteur-vitesse"}, "response": {"en": "reviewed", "fr": "revue"}, "accept": ["check", "complete"], "note": "Every rotary profile has it; nothing reads it."},
+        {"challenge": {"en": "Radio frequencies", "fr": "Fréquences radio"}, "response": {"en": "set", "fr": "affichées"}, "accept": ["set", "check"]},
+        {"challenge": {"en": "Parking brake or rotor brake", "fr": "Frein de parc ou frein rotor"}, "response": {"en": "set", "fr": "serré"}, "accept": ["set", "on"], "check": {"var": "parking_brake", "op": "eq", "value": true}, "note": "The parking brake where the model has one; on many rotorcraft the rotor brake is the wheel brake's stand-in and ROTOR BRAKE ACTIVE is the variable that says so."},
+        {"challenge": {"en": "Battery", "fr": "Batterie"}, "response": {"en": "connected", "fr": "branchée"}, "accept": ["on", "set", "check"], "check": {"var": "battery_master", "op": "eq", "value": true}},
+        {"challenge": {"en": "Circuit breakers", "fr": "Disjoncteurs"}, "response": {"en": "in", "fr": "enclenchés"}, "accept": ["check"]},
+        {"challenge": {"en": "Beacon", "fr": "Feu anticollision"}, "response": {"en": "on", "fr": "allumé"}, "accept": ["on"], "check": {"var": "beacon_light", "op": "eq", "value": true}, "note": "Anti-collision lights on before engine start: 14 CFR 91.209(b)."}
+      ]
+    },
+    "after_start": {
+      "title": {"en": "after start", "fr": "après mise en route"},
+      "items": [
+        {"challenge": {"en": "Engine instruments", "fr": "Paramètres moteur"}, "response": {"en": "within limits", "fr": "dans les limites"}, "accept": ["green", "check", "value"], "note": "Ng, T4/MGT/TOT, oil pressure and temperature in their green arcs; on a twin, both engines."},
+        {"challenge": {"en": "Main rotor", "fr": "Rotor principal"}, "response": {"en": "at flight RPM", "fr": "au régime de vol"}, "accept": ["check", "green", "value"], "check": {"var": "rotor_rpm_pct", "op": "min", "value": 90, "tolerance": 5}, "note": "UNVERIFIED: ROTOR RPM PCT is percent of rated RPM; 90 with tolerance 5 stands in for 'in the green'. A model that does not publish it is unchecked."},
+        {"challenge": {"en": "Rotor brake", "fr": "Frein rotor"}, "response": {"en": "off", "fr": "desseré"}, "accept": ["off", "check"], "check": {"var": "rotor_brake_active", "op": "eq", "value": false}, "note": "UNVERIFIED: models without a rotor brake never answer; nothing is then checked."},
+        {"challenge": {"en": "Caution and warning panel", "fr": "Panneau d'avertissements"}, "response": {"en": "clear", "fr": "éteint"}, "accept": ["check", "green"]},
+        {"challenge": {"en": "Flight controls", "fr": "Commandes de vol"}, "response": {"en": "free and correct", "fr": "libres et dans le bon sens"}, "accept": ["check"], "note": "Cyclic, collective and pedals move the right way; friction clamps as the model has them."},
+        {"challenge": {"en": "Electrical system", "fr": "Système électrique"}, "response": {"en": "checked", "fr": "vérifié"}, "accept": ["check", "value"], "note": "Volts and amps in limits; generator on where the model has one."},
+        {"challenge": {"en": "Avionics master", "fr": "Interrupteur avionique"}, "response": {"en": "on", "fr": "marche"}, "accept": ["on"], "check": {"var": "avionics_master", "op": "eq", "value": true}},
+        {"challenge": {"en": "Radios", "fr": "Radios"}, "response": {"en": "set", "fr": "affichées"}, "accept": ["set", "check"]},
+        {"challenge": {"en": "Altimeter", "fr": "Altimètre"}, "response": {"en": "set", "fr": "calé"}, "accept": ["set", "value"], "check": {"var": "kohlsman_hpa", "op": "near", "value": "$qnh", "tolerance": 1.0}, "note": "Against the QNH the controller gave, else the field's."},
+        {"challenge": {"en": "Transponder code", "fr": "Code transpondeur"}, "response": {"en": "set", "fr": "affiché"}, "accept": ["set", "value"], "rules": "ifr", "check": {"var": "transponder_code", "op": "eq", "value": "$squawk"}},
+        {"challenge": {"en": "Transponder", "fr": "Transpondeur"}, "response": {"en": "VFR code set", "fr": "code VFR affiché"}, "accept": ["set", "value"], "rules": "vfr", "check": {"var": "transponder_code", "op": "eq", "value": "$squawk"}}
+      ]
+    },
+    "taxi": {
+      "title": {"en": "hover taxi", "fr": "taxi héliporté"},
+      "items": [
+        {"challenge": {"en": "Hover check", "fr": "Check au point fixe"}, "response": {"en": "complete", "fr": "effectué"}, "accept": ["check", "complete"], "note": "Cyclic and pedals checked in the hover; the UH-1H profile's hover/taxi check. A wheeled model taxis on its wheels instead, and this is simply 'taxi'."},
+        {"challenge": {"en": "Flight instruments", "fr": "Instruments de vol"}, "response": {"en": "checked", "fr": "vérifiés"}, "accept": ["check"]},
+        {"challenge": {"en": "Navigation source", "fr": "Source de navigation"}, "response": {"en": "set", "fr": "sélectionnée"}, "accept": ["set", "check"], "rules": "ifr"}
+      ]
+    },
+    "before_takeoff": {
+      "title": {"en": "before takeoff", "fr": "avant décollage"},
+      "items": [
+        {"challenge": {"en": "Doors and windows", "fr": "Portes et vitres"}, "response": {"en": "closed and latched", "fr": "fermées et verrouillées"}, "accept": ["check"]},
+        {"challenge": {"en": "Seats and belts", "fr": "Sièges et ceintures"}, "response": {"en": "secure", "fr": "attachés"}, "accept": ["check"]},
+        {"challenge": {"en": "Flight controls and friction", "fr": "Commandes et frictions"}, "response": {"en": "free and set", "fr": "libres et réglées"}, "accept": ["check", "set"], "note": "Collective and cyclic friction as the model has it; pedals centred."},
+        {"challenge": {"en": "Engine and transmission instruments", "fr": "Paramètres moteur et transmission"}, "response": {"en": "within limits", "fr": "dans les limites"}, "accept": ["green", "check", "value"]},
+        {"challenge": {"en": "Anti-ice and pitot heat", "fr": "Anti-givre et réchauffage pitot"}, "response": {"en": "as required", "fr": "selon besoin"}, "accept": ["check", "on", "off"], "check": {"var": "pitot_heat", "op": "eq", "value": true}, "note": "UNVERIFIED per model: the check only bites where the model drives PITOT HEAT."},
+        {"challenge": {"en": "Fuel quantity", "fr": "Quantité carburant"}, "response": {"en": "checked", "fr": "vérifiée"}, "accept": ["check", "value"]},
+        {"challenge": {"en": "Radios and navigation", "fr": "Radios et navigation"}, "response": {"en": "set and tested", "fr": "affichés et essayés"}, "accept": ["set", "check"]},
+        {"challenge": {"en": "Warning and caution lights", "fr": "Voyants d'avertissement"}, "response": {"en": "clear", "fr": "éteints"}, "accept": ["check", "green"]},
+        {"challenge": {"en": "Clearance", "fr": "Clairance"}, "response": {"en": "confirmed", "fr": "confirmée"}, "accept": ["check", "complete"], "rules": "ifr"},
+        {"challenge": {"en": "Navigation source", "fr": "Source de navigation"}, "response": {"en": "set", "fr": "sélectionnée"}, "accept": ["set", "check"], "rules": "ifr"},
+        {"challenge": {"en": "Transponder", "fr": "Transpondeur"}, "response": {"en": "VFR code set", "fr": "code VFR affiché"}, "accept": ["set", "value"], "rules": "vfr", "check": {"var": "transponder_code", "op": "eq", "value": "$squawk"}},
+        {"challenge": {"en": "Landing light", "fr": "Phare d'atterrissage"}, "response": {"en": "on", "fr": "allumé"}, "accept": ["on"], "check": {"var": "landing_light", "op": "eq", "value": true}, "note": "Lights on in the terminal area, as for the fixed-wing classes."},
+        {"challenge": {"en": "Strobes", "fr": "Feux à éclats"}, "response": {"en": "on", "fr": "allumés"}, "accept": ["on"], "check": {"var": "strobe_light", "op": "eq", "value": true}}
+      ]
+    },
+    "after_takeoff": {
+      "title": {"en": "after takeoff", "fr": "après décollage"},
+      "items": [
+        {"challenge": {"en": "Transition", "fr": "Transition"}, "response": {"en": "complete", "fr": "effectuée"}, "accept": ["check", "complete"], "note": "Out of ground effect at the profile's transition speed (~40 kt on the light singles), then to Vy."},
+        {"challenge": {"en": "Climb power", "fr": "Puissance de montée"}, "response": {"en": "set", "fr": "affichée"}, "accept": ["set", "check"], "note": "Max takeoff for five minutes or max continuous, as the model's profile says."},
+        {"challenge": {"en": "Climb speed", "fr": "Vitesse de montée"}, "response": {"en": "checked", "fr": "vérifiée"}, "accept": ["check", "value"]},
+        {"challenge": {"en": "Engine limits", "fr": "Limites moteur"}, "response": {"en": "monitored", "fr": "surveillées"}, "accept": ["check"]}
+      ]
+    },
+    "cruise": {
+      "title": {"en": "cruise", "fr": "croisière"},
+      "items": [
+        {"challenge": {"en": "Power", "fr": "Puissance"}, "response": {"en": "max continuous", "fr": "continu maximal"}, "accept": ["set", "check"]},
+        {"challenge": {"en": "Airspeed", "fr": "Vitesse"}, "response": {"en": "within VNE", "fr": "sous la VNE"}, "accept": ["check", "value"], "note": "VNE falls with altitude and temperature; the placard's figure, not a number the program knows."},
+        {"challenge": {"en": "Main rotor speed", "fr": "Régime rotor"}, "response": {"en": "monitored", "fr": "surveillé"}, "accept": ["check"]},
+        {"challenge": {"en": "Fuel", "fr": "Carburant"}, "response": {"en": "checked", "fr": "vérifié"}, "accept": ["check", "value"]}
+      ]
+    },
+    "descent": {
+      "title": {"en": "descent", "fr": "descente"},
+      "items": [
+        {"challenge": {"en": "Power", "fr": "Puissance"}, "response": {"en": "as required", "fr": "selon besoin"}, "accept": ["set", "check"]},
+        {"challenge": {"en": "Altimeter", "fr": "Altimètre"}, "response": {"en": "set", "fr": "calé"}, "accept": ["set", "value"], "check": {"var": "kohlsman_hpa", "op": "near", "value": "$qnh", "tolerance": 1.0}, "note": "Against the QNH the controller gave, else the field's."},
+        {"challenge": {"en": "Next frequency", "fr": "Fréquence suivante"}, "response": {"en": "set", "fr": "affichée"}, "accept": ["set", "value"], "rules": "vfr", "check": {"var": "com1_standby", "op": "eq", "value": "$frequency"}, "note": "Against the frequency the controller gave; with none given, nothing is checked."},
+        {"challenge": {"en": "Approach briefing", "fr": "Briefing approche"}, "response": {"en": "complete", "fr": "effectué"}, "accept": ["complete", "check"], "rules": "ifr"}
+      ]
+    },
+    "approach": {
+      "title": {"en": "approach", "fr": "approche"},
+      "items": [
+        {"challenge": {"en": "Into wind", "fr": "Vent debout"}, "response": {"en": "established", "fr": "établie"}, "accept": ["check", "complete"], "note": "Every rotary profile's first approach item; nothing reads the wind."},
+        {"challenge": {"en": "Airspeed", "fr": "Vitesse"}, "response": {"en": "at approach speed, low sink rate", "fr": "vitesse d'approche, faible taux de descente"}, "accept": ["check", "set", "value"], "note": "~65 kt on the light singles; the type's figure otherwise."},
+        {"challenge": {"en": "Engine limits", "fr": "Limites moteur"}, "response": {"en": "monitored", "fr": "surveillées"}, "accept": ["check"]},
+        {"challenge": {"en": "Altimeter", "fr": "Altimètre"}, "response": {"en": "set", "fr": "calé"}, "accept": ["set", "value"], "check": {"var": "kohlsman_hpa", "op": "near", "value": "$qnh", "tolerance": 1.0}, "note": "Against the QNH the controller gave, else the field's."},
+        {"challenge": {"en": "Minimums", "fr": "Minima"}, "response": {"en": "set", "fr": "affichés"}, "accept": ["set", "value"], "rules": "ifr", "note": "Not checked: the bug is the model's design figure on most rotorcraft."}
+      ]
+    },
+    "before_landing": {
+      "title": {"en": "before landing", "fr": "avant atterrissage"},
+      "items": [
+        {"challenge": {"en": "Airspeed", "fr": "Vitesse"}, "response": {"en": "at approach speed", "fr": "vitesse d'approche"}, "accept": ["check", "set", "value"]},
+        {"challenge": {"en": "Into wind", "fr": "Vent debout"}, "response": {"en": "established", "fr": "établie"}, "accept": ["check", "complete"]},
+        {"challenge": {"en": "Landing light", "fr": "Phare d'atterrissage"}, "response": {"en": "on", "fr": "allumé"}, "accept": ["on"], "check": {"var": "landing_light", "op": "eq", "value": true}},
+        {"challenge": {"en": "Seats and belts", "fr": "Sièges et ceintures"}, "response": {"en": "secure", "fr": "attachés"}, "accept": ["check"]},
+        {"challenge": {"en": "Approach and landing lights", "fr": "Feux d'approche et d'atterrissage"}, "response": {"en": "as required", "fr": "selon besoin"}, "accept": ["check", "on", "off"]}
+      ]
+    },
+    "after_landing": {
+      "title": {"en": "after landing", "fr": "après atterrissage"},
+      "items": [
+        {"challenge": {"en": "Collective", "fr": "Pas général"}, "response": {"en": "full down after touchdown", "fr": "plein bas après le contact"}, "accept": ["down", "check"], "check": {"var": "collective_position", "op": "max", "value": 10, "tolerance": 5}, "note": "UNVERIFIED: collective_position is per cent depressed; 'full down' reads near zero on models that publish it. Reduced very gradually from the hover and cancelled only after touchdown, as every rotary profile has it."},
+        {"challenge": {"en": "Cyclic", "fr": "Cyclique"}, "response": {"en": "centred", "fr": "au centre"}, "accept": ["check", "set"], "note": "Neutral for the shutdown, as the profiles have it."},
+        {"challenge": {"en": "Strobes", "fr": "Feux à éclats"}, "response": {"en": "off", "fr": "éteints"}, "accept": ["off"], "check": {"var": "strobe_light", "op": "eq", "value": false}}
+      ]
+    },
+    "shutdown": {
+      "title": {"en": "shutdown", "fr": "arrêt moteur"},
+      "items": [
+        {"challenge": {"en": "Unnecessary systems", "fr": "Systèmes inutiles"}, "response": {"en": "off", "fr": "coupés"}, "accept": ["off", "check"]},
+        {"challenge": {"en": "Idle cool-down", "fr": "Refroidissement au ralenti"}, "response": {"en": "complete", "fr": "effectué"}, "accept": ["check", "complete"], "note": "Two minutes at idle on the 407's profile, thirty seconds before the start selector on the H125's; the model's figure."},
+        {"challenge": {"en": "Rotor brake", "fr": "Frein rotor"}, "response": {"en": "applied at low rotor speed", "fr": "serré à faible régime"}, "accept": ["set", "on", "check"], "check": {"var": "rotor_brake_active", "op": "eq", "value": true}, "note": "UNVERIFIED: applied below ~40% NR on the 407, below ~140-170 rpm on the H125; models without one are unchecked."},
+        {"challenge": {"en": "Engine", "fr": "Moteur"}, "response": {"en": "off", "fr": "arrêté"}, "accept": ["off", "check"], "check": {"var": "engines_running", "op": "eq", "value": false}},
+        {"challenge": {"en": "Avionics master", "fr": "Interrupteur avionique"}, "response": {"en": "off", "fr": "arrêt"}, "accept": ["off"], "check": {"var": "avionics_master", "op": "eq", "value": false}},
+        {"challenge": {"en": "Battery", "fr": "Batterie"}, "response": {"en": "off", "fr": "coupée"}, "accept": ["off"], "check": {"var": "battery_master", "op": "eq", "value": false}},
+        {"challenge": {"en": "Tie-downs or rotor blades tied", "fr": "Amarrages ou pales arrimées"}, "response": {"en": "as required", "fr": "selon besoin"}, "accept": ["check", "set"]}
+      ]
+    }
+  }
+}

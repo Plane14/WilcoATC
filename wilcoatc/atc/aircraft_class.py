@@ -5,7 +5,8 @@ A checklist and a callout belong to a class of aeroplane, not to a type: a
 C172 and a DA40 run the same before-takeoff run-up, an A320 and a 737 call
 "eighty knots" and "V one" alike, and nobody calls V1 in a Cessna. Seven
 classes: piston single, piston twin, turboprop single, turboprop twin,
-business jet, airliner and helicopter.
+business jet, airliner and helicopter. Every class has checklists now;
+a helicopter's are thinner, because its systems are.
 
 Nothing in the program classified the pilot's own aeroplane before this.
 ``fleet.py`` chooses aeroplanes for a field's invented traffic from short
@@ -45,9 +46,6 @@ HELICOPTER = "helicopter"
 
 CLASSES: tuple[str, ...] = (PISTON_SINGLE, PISTON_TWIN, TURBOPROP_SINGLE,
                             TURBOPROP_TWIN, BUSINESS_JET, AIRLINER, HELICOPTER)
-
-#: Callouts only for these: no checklist is written for them yet.
-CALLOUTS_ONLY = frozenset({HELICOPTER})
 
 # ``ENGINE TYPE`` as the simulator enumerates it: 0 piston, 1 jet, 2 none,
 # 3 helicopter turbine, 4 unsupported, 5 turboprop -- the SimConnect
@@ -128,7 +126,7 @@ class AircraftClass:
 
     @property
     def checklists(self) -> bool:
-        return self.name not in CALLOUTS_ONLY
+        return True
 
 
 def _from_description(description: str) -> str:
