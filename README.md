@@ -1200,6 +1200,46 @@ the simulator's title and leave everything but the gear and flaps unchecked;
 every disagreement the first officer does see is a `mismatch` line in `logs
 crew`, with the aircraft's title, so the list can grow.
 
+**Autonomous flight, fixed-wing.** `immersion.autonomous_flight` flies the
+aeroplane itself from startup to shutdown (`wilcoatc/atc/autonomous.py`,
+with the hands in `wilcoatc/atc/ap.py` and the geometry in
+`wilcoatc/atc/auto_nav.py`). The First Officer runs the before-start
+checklist, sets the squawk, altimeter and lights, starts the engines, sits
+through pushback until the aeroplane stops, taxis the route the tower
+planned (`session.taxi_path`), holds short, lines up on the centreline,
+takes off — rotating at the model's own `min rotation` speed where it
+declares one, otherwise the type's table — and hands the leg to the
+autopilot for the climb, cruise and descent. Descent is planned from the
+distance to the field (~318 ft per mile on the three-degree path) and the
+aeroplane is configured by height: gear, then approach and final flap,
+speedbrakes armed. On the approach it captures the localizer and
+glideslope where the needles say an ILS is there, otherwise it flies the
+runway heading on a vertical-speed glide; it calls "stabilized" only when
+speed, sink rate, bank and centreline actually say so, and it goes around
+— power, pitch, configuration — when the tower calls it, when it is not
+stable below minimums, or when the sink rate or bank says so. The flare
+and the rollout are flown by hand on the control events, spoilers and
+brakes included, then it taxis in to the stand and shuts down: secure,
+cool (turbines), engines off, electrics off.
+
+`immersion.autonomous_ap_mode` chooses how the autopilot is managed:
+`managed` uses the aeroplane's own modes — flight-level change for the
+climb and descent, NAV for the route, APR for the approach — while
+`direct` sets heading, altitude, vertical speed and indicated airspeed
+explicitly, for the aeroplanes whose autopilots do not fly managed legs.
+Every control goes through one place that tries the cleanest means first
+and falls back where a model does not answer; a name the simulator does
+not know is remembered rather than asked again. `immersion.autonomous_use_sim_ai`
+is currently unused — there is no SimConnect path to the simulator's own
+AI pilot, so the First Officer always flies its own autopilot.
+`immersion.autonomous_chained_flights` keeps the aeroplane flying: after
+shutdown it picks a random suitable destination within range — runway
+length and ground services checked against the navdata — files a new leg
+and starts again after `autonomous_chain_delay_s`. Basic emergencies are
+watched for: a collapsing main bus or an engine that stops in the air,
+empty fuel, or a fuel figure that was seen and then reads zero all declare
+a MAYDAY, divert to the nearest suitable field and land there.
+
 **Autonomous flight in a helicopter.** `immersion.autonomous_flight` flies a
 rotorcraft too, through its own controller (`wilcoatc/atc/autonomous_heli.py`)
 rather than the aeroplane's: engine start on a best-effort basis (the

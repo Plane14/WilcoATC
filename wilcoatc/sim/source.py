@@ -421,6 +421,11 @@ class SimConnectSource:
         # recognise COM_STBY_RADIO_SET_HZ at all, so a single flag learned
         # from the active radio silently breaks the standby one.
         self._freq_event_style: dict[tuple[int, bool], str] = {}
+        # One data definition per written variable, made on first use. A
+        # variable the simulator does not have fails its first write and is
+        # remembered as unwritable rather than asked for again every tick.
+        self._writers: dict[str, object] = {}
+        self._unwritable: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -480,6 +485,8 @@ class SimConnectSource:
             # missing from the last aircraft may be present in this one.
             self._events.clear()
             self._freq_event_style.clear()
+            self._writers.clear()
+            self._unwritable.clear()
             self._missing.clear()
             self._silent.clear()
             self._values.clear()
@@ -916,10 +923,49 @@ class SimConnectSource:
             return False
         return self._send(b"XPNDR_SET", packed)
 
+    def set_variable(self, name: str, value: float) -> bool:
+        """Write a simulation variable on the user's aircraft.
+
+        For what no event reaches: the throttle lever's position, a fuel
+        selector, a trim. Each name gets one data definition, made on first
+        use; a name the simulator refuses is remembered in ``_unwritable``
+        so the caller's fallback is tried instead of asking every tick.
+        Returns False when there is no answer, which is never an error --
+        the First Officer flies by events where this cannot write.
+        """
+        if not self._connected or self._sim is None or name in self._unwritable:
+            return False
+        try:
+            from SimConnect import Request
+        except ImportError:
+            return False
+        writer = self._writers.get(name)
+        if writer is None:
+            writer = Request((name.encode(), b"Number"), self._sim,
+                             _dec=name, _settable=True)
+            self._writers[name] = writer
+        try:
+            writer.value = float(value)
+            # The setter swallows a refused definition, so the flag is the
+            # only answer there is: False until AddToDataDefinition has
+            # been accepted, which is the write's first failure point.
+            if getattr(writer, "defined", False):
+                return True
+            self._unwritable.add(name)
+            self._writers.pop(name, None)
+            return False
+        except Exception as exc:
+            log.debug("simvar write %s failed: %s", name, exc)
+            self._unwritable.add(name)
+            self._writers.pop(name, None)
+            return False
+
     def close(self) -> None:
         self._connected = False
         self._events.clear()
         self._freq_event_style.clear()
+        self._writers.clear()
+        self._unwritable.clear()
         if self._sim is not None:
             try:
                 self._sim.exit()
