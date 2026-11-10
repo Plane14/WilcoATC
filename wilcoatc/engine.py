@@ -292,7 +292,7 @@ class Engine:
         if self.config.immersion.autonomous_flight:
             self.autonomous_flight = create_autonomous_flight(
                 self.config, self.navdb, None, None, self.crew, self.brain,
-                lambda: self.state, self.emit
+                lambda: self.state, self.emit, use_route=self.use_route
             )
 
         # Rules first; the AI layer only sees what they could not classify.

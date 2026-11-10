@@ -27,15 +27,11 @@ from enum import Enum
 from typing import Callable, Optional
 
 from ..config import Config
+from ..navdata.build import haversine_nm
 from ..navdata.db import NavDB, Airport
 from ..sim.source import SimConnectSource
 from .session import FlightSession, Phase
-from .checklist import ChecklistRunner
-from .callouts import Callouts, Situation
 from .crew import CrewDirector
-from .profile import FlightProfile
-from .phraseology import Aircraft
-from .copilot import confirmation, readback
 from .controller import ControllerBrain
 
 log = logging.getLogger(__name__)
@@ -90,6 +86,12 @@ class AutonomousState:
     checklists_completed: set[str] = field(default_factory=set)
     # Timing
     last_action_at: float = 0.0
+    # Pushback tracking: the simulator gives no "tug attached" variable, so
+    # the phase watches the groundspeed instead -- moving means the push is
+    # under way, stationary again for a while means it is done.
+    push_requested: bool = False
+    moved_since_push: bool = False
+    still_since: float = 0.0
     # Chain flights
     chain_flight_index: int = 0
     chain_flights: list[dict] = field(default_factory=list)
@@ -114,6 +116,7 @@ class AutonomousFlight:
         brain: ControllerBrain,
         get_state: Callable[[], object],
         on_event: Callable[[str, str, str], None],
+        use_route: Optional[Callable[[object], None]] = None,
     ):
         self.config = config
         self.navdb = navdb
@@ -123,6 +126,7 @@ class AutonomousFlight:
         self.brain = brain
         self.get_state = get_state
         self.on_event = on_event
+        self.use_route = use_route
 
         self.state = AutonomousState()
         self._enabled = config.immersion.autonomous_flight
@@ -132,8 +136,10 @@ class AutonomousFlight:
         self._request_ifr = config.immersion.autonomous_request_ifr
         self._use_sim_ai = config.immersion.autonomous_use_sim_ai
 
-        # Compute aircraft range for chain planning
-        self._compute_aircraft_performance(session)
+        # Compute aircraft range for chain planning. The engine builds this
+        # before a flight exists, so the session can be None.
+        if session is not None:
+            self._compute_aircraft_performance(session)
 
         # Timing constants
         self.ACTION_INTERVAL = 1.0  # seconds between autonomous actions
@@ -186,13 +192,16 @@ class AutonomousFlight:
                     range_nm = r
                     break
 
-        # Default fallback based on category
+        # Default fallback based on the class the profile gives the type
         if not range_nm:
+            from . import aircraft_class as ac
+
+            found = session.profile.classify(type_code).name
             if session.profile.airliner:
                 range_nm = 2500
-            elif session.profile.business_jet:
+            elif found == ac.BUSINESS_JET:
                 range_nm = 2000
-            elif session.profile.turboprop:
+            elif found in (ac.TURBOPROP_SINGLE, ac.TURBOPROP_TWIN):
                 range_nm = 1000
             else:
                 range_nm = 500
@@ -241,6 +250,15 @@ class AutonomousFlight:
         # Rate limit actions
         if now - self.state.last_action_at < self.ACTION_INTERVAL:
             return
+
+        # Pushback progress, which the phase reads: a push that has moved the
+        # aeroplane and then stopped is done, however the tug was attached.
+        if self.state.phase == AutonomousPhase.PUSHBACK:
+            if state.ground_speed_kt > 2.0:
+                self.state.moved_since_push = True
+                self.state.still_since = now
+            elif self.state.moved_since_push and self.state.still_since == 0.0:
+                self.state.still_since = now
 
         # Execute phase logic
         self._execute_phase(state, now)
@@ -327,14 +345,15 @@ class AutonomousFlight:
         if state.parking_brake:
             self._release_parking_brake()
 
-        # Request pushback via GSX or sim
-        if not self.state.pushing:
+        # Request pushback via the simulator (GSX takes it over when it is
+        # set to, which its own event does not know).
+        if not self.state.push_requested:
             self._request_pushback()
+            self.state.push_requested = True
 
-        # Check if pushback complete (stationary after moving)
-        if self.state.pushing and abs(state.ground_speed_kt) < 1.0:
-            if now - self.state.still_since > 10.0:
-                self._transition(AutonomousPhase.TAXI_OUT)
+        # Check if pushback complete: the aeroplane moved, then stopped.
+        if self.state.moved_since_push and now - self.state.still_since > 10.0:
+            self._transition(AutonomousPhase.TAXI_OUT)
 
         if now - self.state.phase_entered_at > self.PUSHBACK_TIMEOUT:
             self._set_error("Pushback timeout")
@@ -386,8 +405,11 @@ class AutonomousFlight:
         # Apply takeoff power
         self._set_takeoff_power()
 
-        # Steer with nose wheel until rotation
-        if state.indicated_airspeed_kt > 80:
+        # Steer with nose wheel until rotation. The aeroplane's own figures
+        # where it declares them; 80 kt is only the fallback for a model
+        # that does not.
+        rotate_kt = state.min_rotation_kt or state.design_takeoff_kt or 80.0
+        if state.indicated_airspeed_kt > rotate_kt:
             self._rotate(state)
 
         if now - self.state.phase_entered_at > self.TAKEOFF_TIMEOUT:
@@ -486,7 +508,10 @@ class AutonomousFlight:
         self._shutdown_engines()
         self._run_checklist_for_phase("shutdown")
 
-        if self._chained and self.state.chain_flights:
+        # CHAIN_NEXT picks the destination itself when the list is empty,
+        # which it always is unless a queue was set: chaining has to be
+        # entered for the first leg to be chosen at all.
+        if self._chained:
             self._transition(AutonomousPhase.CHAIN_NEXT)
         else:
             self._transition(AutonomousPhase.SHUTDOWN)
@@ -498,14 +523,15 @@ class AutonomousFlight:
 
     def _phase_chain_next(self, state, now: float) -> None:
         """Load and start next flight in chain with random destination."""
-        # Select next destination if not pre-planned
-        if not self.state.chain_flights:
+        # Select next destination if the queue is exhausted. An empty list
+        # and a spent one look the same here: both mean "choose one".
+        if self.state.chain_flight_index >= len(self.state.chain_flights):
             self._select_next_destination()
-            if not self.state.chain_flights:
-                self._emit("info", "No suitable destination found for next flight",
-                           "autonomous.chain.no_destination")
-                self._transition(AutonomousPhase.SHUTDOWN)
-                return
+        if self.state.chain_flight_index >= len(self.state.chain_flights):
+            self._emit("info", "No suitable destination found for next flight",
+                       "autonomous.chain.no_destination")
+            self._transition(AutonomousPhase.SHUTDOWN)
+            return
 
         # Wait for chain delay
         if now - self.state.phase_entered_at < self._chain_delay:
@@ -520,7 +546,10 @@ class AutonomousFlight:
 
     def _select_next_destination(self) -> None:
         """Select a random destination within aircraft range with ground services."""
-        current = self.session.departure or self._get_current_airport()
+        # Where the aeroplane actually is: the field it just landed at, not
+        # the departure of the leg that ended -- session.departure still
+        # names that one.
+        current = self._get_current_airport() or self.session.departure
         if not current:
             log.warning("Cannot select next destination: no current airport")
             return
@@ -547,20 +576,19 @@ class AutonomousFlight:
         state = self.get_state()
         if state and state.has_position:
             return self.navdb.home_airport(state.latitude, state.longitude)
-        return self.session.departure
+        # Where it landed, failing that where it set out from.
+        return self.session.destination or self.session.departure
 
     def _find_suitable_destinations(self, origin: Airport) -> list[tuple[Airport, float]]:
         """Find airports within range that can host the aircraft with ground services."""
         candidates = []
         max_range = self.state.aircraft_range_nm * 0.8  # 80% of max range for reserves
 
-        # Get all airports within range
-        for airport in self.navdb.airports.values():
+        # Get all airports within range. Nearest-first out of the database,
+        # then re-sorted below by how well each suits the leg.
+        for airport, distance in self.navdb.nearest_airports(
+                origin.lat, origin.lon, limit=5000, max_nm=max_range):
             if airport.ident == origin.ident:
-                continue
-
-            distance = origin.distance_to(airport)
-            if distance > max_range:
                 continue
 
             # Check if airport can handle this aircraft type
@@ -658,7 +686,8 @@ class AutonomousFlight:
 
     def _create_flight_plan(self, origin: Airport, destination: Airport) -> dict:
         """Create a flight plan dictionary for the leg."""
-        distance = origin.distance_to(destination)
+        distance = haversine_nm(origin.lat, origin.lon,
+                                destination.lat, destination.lon)
 
         # Determine cruise altitude based on distance and aircraft type
         if distance < 200:
@@ -704,30 +733,38 @@ class AutonomousFlight:
         # Reset clearance state
         self.session.clearance_issued = False
         self.session.clearance_read_back = False
+        self.session.assigned_altitude_ft = 0.0
+        self.session.assigned_heading = None
+        self.session.assigned_speed_kt = None
+        self.session.cleared_takeoff = False
+        self.session.cleared_landing = False
+        self.session.lined_up = False
         self.state.has_ifr_clearance = False
         self.state.clearance_read_back = False
+        self.state.push_requested = False
+        self.state.moved_since_push = False
+        self.state.still_since = 0.0
         self.state.checklists_completed.clear()
 
-        # Rebuild route
-        from .route import from_ofp
-        # Create a minimal OFP-like object
-        class SimplePlan:
-            def __init__(self, fp):
-                self.origin = fp["origin"]
-                self.destination = fp["destination"]
-                self.cruise_altitude_ft = fp["cruise_altitude_ft"]
-                self.route = f"DCT {fp['destination']}"
-                self.sid = ""
-                self.star = ""
-                self.arrival_runway = ""
-                self.planned_runway = ""
-                self.ifr = fp.get("ifr", True)
+        # The new leg's own airports, so the controllers work it as a flight
+        # of its own rather than the one that ended at the last one.
+        self.session.departure = self.navdb.airport(flight_plan["origin"])
 
-        plan = SimplePlan(flight_plan)
-        self.use_route(from_ofp(plan))
+        # A direct route to the destination: the leg is filed non-stop, and
+        # every fix en route is the controllers' to give.
+        from .route import from_string, resolver
+
+        route = from_string(
+            f"DCT {flight_plan['destination']}",
+            flight_plan["origin"], flight_plan["destination"],
+            resolver(self.navdb), cruise_ft=flight_plan["cruise_altitude_ft"])
+        if self.use_route is not None:
+            self.use_route(route)
 
         self._emit("info", f"Next flight: {flight_plan['origin']} -> {flight_plan['destination']}",
                    "autonomous.chain.next")
+
+    def _phase_error(self, state, now: float) -> None:
         """Error state - disable autonomous flight."""
         self._emit("error", f"Autonomous flight error: {self.state.error_message}",
                    "autonomous.error")
@@ -773,12 +810,15 @@ class AutonomousFlight:
         self._send_event(b"PARKING_BRAKES", 1)
 
     def _request_pushback(self) -> None:
-        """Request pushback via GSX or sim pushback."""
-        # Try GSX first
-        if hasattr(self, '_gsx_pushback'):
-            self._gsx_pushback()
-        else:
-            self._send_event(b"TOGGLE_PUSHBACK", 0)
+        """Request pushback: the simulator's own, which GSX takes over when
+        it is set to."""
+        if self.sim is not None and getattr(self.sim, "connected", False):
+            try:
+                if self.sim.pushback():
+                    return
+            except Exception as e:
+                log.debug("simulator pushback failed: %s", e)
+        self._send_event(b"TOGGLE_PUSHBACK", 0)
 
     def _request_clearance_via_fo(self) -> None:
         """Request IFR clearance through the first officer."""
@@ -823,7 +863,11 @@ class AutonomousFlight:
         """Level off at cruise altitude."""
         self._engage_altitude_hold()
         self._engage_nav_mode()
-        self._set_autopilot_speed(self.session.cruise_altitude_ft)
+        # Only a speed the controller actually assigned; the cruise level is
+        # not a speed, and feeding it to the autopilot's knots window asks
+        # for a number no aeroplane has.
+        if self.session.assigned_speed_kt:
+            self._set_autopilot_speed(self.session.assigned_speed_kt)
 
     def _engage_autopilot_master(self) -> None:
         """Turn on autopilot master."""
@@ -880,11 +924,6 @@ class AutonomousFlight:
         """Shutdown engines."""
         self._send_event(b"ENGINE_AUTO_SHUTDOWN", 1)
 
-    def _load_next_flight(self, flight_plan: dict) -> None:
-        """Load the next flight in the chain."""
-        # This would load a new flight plan via SimBrief or .pln file
-        log.info("Loading next flight in chain: %s", flight_plan)
-
     def _send_event(self, event_name: bytes, value: int) -> bool:
         """Send a SimConnect event."""
         if not self.sim or not self.sim.connected:
@@ -905,11 +944,13 @@ def create_autonomous_flight(
     brain: ControllerBrain,
     get_state: Callable[[], object],
     on_event: Callable[[str, str, str], None],
+    use_route: Optional[Callable[[object], None]] = None,
 ) -> Optional[AutonomousFlight]:
     """Factory function to create AutonomousFlight if enabled."""
     if config.immersion.autonomous_flight:
         return AutonomousFlight(
-            config, navdb, sim_source, session, crew, brain, get_state, on_event
+            config, navdb, sim_source, session, crew, brain, get_state,
+            on_event, use_route
         )
     return None
 

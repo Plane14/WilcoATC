@@ -1446,7 +1446,17 @@ function paintImmersion(immersion) {
   toggle("set-bilingual", immersion.bilingual);
   toggle("set-recordings", immersion.recordings);
   toggle("set-interphone", immersion.interphone);
+  toggle("set-autonomous", immersion.autonomous_flight);
+  toggle("set-autonomous-chained", immersion.autonomous_chained_flights);
+  toggle("set-autonomous-ifr", immersion.autonomous_request_ifr);
+  toggle("set-autonomous-sim-ai", immersion.autonomous_use_sim_ai);
   chips("verbosity-chips", "verbosity", immersion.verbosity);
+  chips("autonomous-ap-chips", "ap-mode", immersion.autonomous_ap_mode);
+  const delay = $("set-autonomous-delay");
+  if (delay) {
+    delay.value = immersion.autonomous_chain_delay_s;
+    autonomousDelayText(immersion.autonomous_chain_delay_s);
+  }
 
   const folder = $("set-recordings-dir");
   if (folder && document.activeElement !== folder) {
@@ -1957,6 +1967,10 @@ const IMMERSION_SWITCHES = {
   "set-bilingual": "immersion.bilingual",
   "set-recordings": "immersion.recordings",
   "set-interphone": "immersion.interphone",
+  "set-autonomous": "immersion.autonomous_flight",
+  "set-autonomous-chained": "immersion.autonomous_chained_flights",
+  "set-autonomous-ifr": "immersion.autonomous_request_ifr",
+  "set-autonomous-sim-ai": "immersion.autonomous_use_sim_ai",
 };
 
 /**
@@ -2050,6 +2064,14 @@ function wireOperator() {
 
 /** "saved" is said on the card that was touched: the first officer and the
  * cabin are two sections, and only one of them is on screen. */
+/** The chained-flight delay, said the way a pilot would say it. */
+function autonomousDelayText(seconds) {
+  const node = $("autonomous-delay-value");
+  if (!node) return;
+  const s = Number(seconds) || 0;
+  text(node, s > 0 && s % 60 === 0 ? `${s / 60} min` : `${s} s`);
+}
+
 function immersionNote(element) {
   const card = element && element.closest(".card");
   const box = card && card.querySelector(".saved");
@@ -2069,6 +2091,19 @@ function wireImmersion() {
     on(chip, "click", () =>
       save({ "immersion.verbosity": chip.dataset.verbosity }, "saved-immersion"));
   }
+
+  for (const chip of ($("autonomous-ap-chips") || { querySelectorAll: () => [] })
+       .querySelectorAll(".chip")) {
+    on(chip, "click", () =>
+      save({ "immersion.autonomous_ap_mode": chip.dataset.apMode },
+           "saved-autonomous"));
+  }
+
+  const delay = $("set-autonomous-delay");
+  on(delay, "input", () => autonomousDelayText(Number(delay.value)));
+  on(delay, "change", () =>
+    save({ "immersion.autonomous_chain_delay_s": Number(delay.value) },
+         "saved-autonomous"));
 
   // The two voice pickers. "A man" and "a woman" are a gender rather than a
   // person, so they clear whatever voice was pinned; naming a voice clears

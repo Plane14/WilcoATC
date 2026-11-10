@@ -1002,6 +1002,62 @@
           </div>
           <div class="saved" id="saved-immersion"></div>
         </div>
+
+        <div class="card immersion" data-section="autonomous" data-icon="plane">
+          <div class="card-head">
+            <h2 data-i18n="set.autonomous_flight">Autonomous flight</h2>
+          </div>
+          <div class="why" data-i18n="set.autonomous_card_why">
+            The first officer flies the whole flight -- clearance, pushback,
+            taxi, takeoff, cruise, approach and shutdown -- on the
+            autopilot. You can still talk to the controller and take over at
+            any point.
+          </div>
+          <div class="setting">
+            <div class="text">
+              <div class="name" data-i18n="set.autonomous">Let the first officer fly</div>
+              <div class="why" data-i18n="set.autonomous_why">From the gate to the gate, using the autopilot and the aeroplane's own systems</div>
+            </div>
+            <button class="switch" id="set-autonomous" role="switch" aria-pressed="false"></button>
+          </div>
+          <div class="setting">
+            <div class="text">
+              <div class="name" data-i18n="set.autonomous_chained">Chain the next flight</div>
+              <div class="why" data-i18n="set.autonomous_chained_why">After shutdown, pick a new destination within range and fly it too</div>
+            </div>
+            <button class="switch" id="set-autonomous-chained" role="switch" aria-pressed="false"></button>
+          </div>
+          <div class="setting">
+            <div class="text">
+              <div class="name" data-i18n="set.autonomous_request_ifr">Ask for IFR when it fits</div>
+              <div class="why" data-i18n="set.autonomous_request_ifr_why">Off, the flight runs VFR or on flight following only</div>
+            </div>
+            <button class="switch" id="set-autonomous-ifr" role="switch" aria-pressed="true"></button>
+          </div>
+          <div class="setting">
+            <div class="text">
+              <div class="name" data-i18n="set.autonomous_use_sim_ai">Let the simulator's AI fly parts of it</div>
+              <div class="why" data-i18n="set.autonomous_use_sim_ai_why">For the legs the first officer does not manage itself. Off by default: it can argue with the autopilot settings.</div>
+            </div>
+            <button class="switch" id="set-autonomous-sim-ai" role="switch" aria-pressed="false"></button>
+          </div>
+          <div class="field-block">
+            <div class="label" data-i18n="set.autonomous_ap_mode">How the autopilot is flown</div>
+            <div class="chips" id="autonomous-ap-chips">
+              <button class="chip" data-ap-mode="managed" data-i18n="set.ap_mode_managed">Managed</button>
+              <button class="chip" data-ap-mode="direct" data-i18n="set.ap_mode_direct">Direct</button>
+            </div>
+            <div class="why" data-i18n="set.autonomous_ap_mode_why">Managed uses the aeroplane's own modes, as an airline flies it; direct sets headings and levels straight, which more aeroplanes understand.</div>
+          </div>
+          <div class="setting">
+            <div class="text">
+              <div class="name" data-i18n="set.autonomous_chain_delay">Wait between chained flights</div>
+              <div class="why" id="autonomous-delay-value">2 min</div>
+            </div>
+            <input id="set-autonomous-delay" type="range" min="30" max="3600" step="30" style="width:130px">
+          </div>
+          <div class="saved" id="saved-autonomous"></div>
+        </div>
       </div>
       </div>
     </section>
