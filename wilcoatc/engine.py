@@ -609,6 +609,10 @@ class Engine:
         # When a controller last spoke, so a bare "say again" after them is
         # theirs and not the first officer's (answer_the_aeroplane).
         self._atc_said_at = 0.0
+        # Radio renders the lane is carrying: the cabin reads this through
+        # radio_busy so nobody starts a cabin line over a transmission that
+        # is on its way to the speaker but not on it yet.
+        self._radio_renders = 0
         # The debounced on-ground flag (see _debounced_ground).
         self._ground_seen: bool | None = None
         self._ground_disagrees = 0
@@ -3427,33 +3431,49 @@ class Engine:
 
     def speak(self, text: str, station: Station, atis: bool = False,
               language: str = "en") -> None:
-        """Synthesise and queue a controller transmission."""
+        """Render and queue a controller transmission.
+
+        The render runs on the synthesiser's own lane: a CPU engine takes
+        seconds per transmission and this method used to spend them on the
+        situation loop, which was the worst of the long ticks. The audio
+        lands on the player when the lane's drain runs it back, ahead of
+        anything the cabin asked for first.
+        """
         # The last guard: whatever path got here, a dead radio plays nothing.
         if not self.radio_powered:
             return
         if not atis:
             self._atc_said_at = time.monotonic()
-        try:
-            with timed("synthesis", warn_over_ms=4000):
-                transmission = self.synth.speak(
-                    self.spoken_form(text),
-                    facility=station.facility or station.ident,
-                    position=station.position,
-                    ident=station.ident,
-                    language=language,
-                    distance_nm=station.distance_nm,
-                    altitude_ft=self.state.altitude_ft,
-                    profile=PROFILE_ATIS if atis else None,
-                    radio=self.config.audio.radio_effects,
-                )
-        except VoicesMissing as exc:
+        spoken = self.spoken_form(text)
+        altitude = self.state.altitude_ft
+        radio_fx = self.config.audio.radio_effects
+        self._radio_renders += 1
+        self.synth.render_soon(
+            lambda: self.synth.speak(
+                spoken,
+                facility=station.facility or station.ident,
+                position=station.position,
+                ident=station.ident,
+                language=language,
+                distance_nm=station.distance_nm,
+                altitude_ft=altitude,
+                profile=PROFILE_ATIS if atis else None,
+                radio=radio_fx,
+            ),
+            on_done=lambda tr, err: self._spoken(tr, err, station),
+            priority=0)
+
+    def _spoken(self, transmission, error, station: Station) -> None:
+        """A rendered transmission handed back on the loop: play it."""
+        self._radio_renders = max(0, self._radio_renders - 1)
+        if isinstance(error, VoicesMissing):
             # Not a fault: a download that has not happened. It reads as one
             # every time the controller opens their mouth, so it is said once
             # per session and then the panel is asked to put the download
             # dialog up, which is the only thing that actually fixes it.
             first = not self._voices_reported
             self._voices_reported = True
-            log.warning("no controller voices: %s", exc.where())
+            log.warning("no controller voices: %s", error.where())
             self.emit(
                 "error",
                 "The controller voices have not been downloaded yet. "
@@ -3462,10 +3482,13 @@ class Engine:
                 action="setup" if first else "",
             )
             return
-        except Exception as exc:
-            log.exception("synthesis failed")
-            self.emit("error", f"Could not synthesise the transmission: {exc}",
-                       key="log.synthesis_failed", detail=exc)
+        if error is not None:
+            log.error("synthesis failed", exc_info=error)
+            self.emit("error",
+                      f"Could not synthesise the transmission: {error}",
+                      key="log.synthesis_failed", detail=error)
+            return
+        if transmission is None:
             return
         self.player.play(
             transmission.audio, transmission.sample_rate, label=station.callsign
@@ -3541,6 +3564,9 @@ class Engine:
         previous = self.state
         with timed("tick.read", warn_over_ms=500):
             state = self.refresh_state()
+        # Renders the lane finished since the last pass, handed back on this
+        # thread: the radio to the player, a crew line to its queue slot.
+        self.synth.drain_renders()
         session = self.session
         if session is None:
             return
@@ -3771,7 +3797,8 @@ class Engine:
         # else: how many of them are on the field is what decides how many
         # more to invent, and a strip for one of them has to exist before the
         # tower looks at the field.
-        self._take_observed(session)
+        with timed("tick.traffic.observed", warn_over_ms=500):
+            self._take_observed(session)
 
         # And where the user is, so the traffic works a field with the
         # aeroplane that matters on it rather than around a hole. A departure
@@ -3798,15 +3825,18 @@ class Engine:
             tuned=station,
         )
 
-        self._follow_ground(station.ident)
+        with timed("tick.traffic.ground", warn_over_ms=500):
+            self._follow_ground(station.ident)
 
         now = time.monotonic()
         # Whatever has fallen due joins the back of the queue. It is not spoken
         # here: the frequency may be busy, and a transmission that cannot be
         # heard has to wait rather than disappear.
-        self._traffic_queue.extend(self.traffic.poll(now, station.position,
-                                                     station.mhz))
-        self._speak_from_the_queue(station, now)
+        with timed("tick.traffic.poll", warn_over_ms=500):
+            self._traffic_queue.extend(
+                self.traffic.poll(now, station.position, station.mhz))
+        with timed("tick.traffic.speak", warn_over_ms=500):
+            self._speak_from_the_queue(station, now)
 
         # And the same aeroplanes, where they can be seen. This is every
         # flight the injector is running, not only the ones on this frequency:
@@ -3815,7 +3845,8 @@ class Engine:
         # Only the invented ones: the rest are already in the simulator, and
         # creating a second copy of an FSLTL aeroplane a foot from the first is
         # the one way this could make the window worse rather than better.
-        self._keep_traffic_real(now)
+        with timed("tick.traffic.real", warn_over_ms=500):
+            self._keep_traffic_real(now)
 
     centre_traffic = None
 
@@ -4074,11 +4105,14 @@ class Engine:
             # the pilot, five at ten kilometres.
             self.simtraffic.viewer = (self.state.latitude, self.state.longitude)
         self._choose_models(positions, now)
-        self.simtraffic.sync(positions, now)
+        with timed("tick.traffic.sync", warn_over_ms=500):
+            self.simtraffic.sync(positions, now)
         confirmed, dropped = self.traffic.confirm(
             self.simtraffic.has, self.simtraffic.failed, now)
-        self._keep_handling_real(now)
-        self._keep_systems_real(now)
+        with timed("tick.traffic.handling", warn_over_ms=500):
+            self._keep_handling_real(now)
+        with timed("tick.traffic.systems", warn_over_ms=500):
+            self._keep_systems_real(now)
         self._say_traffic_status(now)
         self._say_motion_status(now)
         if not self.simtraffic.drawing:
@@ -4704,34 +4738,38 @@ class Engine:
             rules=("IFR" if call.flight and call.flight.ifr else "VFR"),
             phase=call.flight.phase if call.flight else "",
         )
-        try:
-            if call.from_pilot:
-                operator = call.flight.operator
-                home = (operator.home[0] if operator and operator.home
-                        else station.ident)
-                transmission = self.synth.speak(
-                    self.spoken_form(call.text),
-                    facility=call.flight.written,
-                    position="PILOT",
-                    ident=home,
-                    language=call.language,
-                    distance_nm=6.0,
-                    altitude_ft=call.flight.altitude_ft,
-                    radio=self.config.audio.radio_effects,
-                )
-            else:
-                transmission = self.synth.speak(
-                    self.spoken_form(call.text),
-                    facility=station.facility or station.ident,
-                    position=station.position,
-                    ident=station.ident,
-                    language=call.language,
-                    distance_nm=station.distance_nm,
-                    altitude_ft=self.state.altitude_ft,
-                    radio=self.config.audio.radio_effects,
-                )
-        except Exception:
-            log.debug("traffic synthesis failed", exc_info=True)
+        if call.from_pilot:
+            operator = call.flight.operator
+            home = (operator.home[0] if operator and operator.home
+                    else station.ident)
+            args = dict(facility=call.flight.written, position="PILOT",
+                        ident=home, language=call.language,
+                        distance_nm=6.0,
+                        altitude_ft=call.flight.altitude_ft)
+        else:
+            args = dict(facility=station.facility or station.ident,
+                        position=station.position, ident=station.ident,
+                        language=call.language,
+                        distance_nm=station.distance_nm,
+                        altitude_ft=self.state.altitude_ft)
+        spoken = self.spoken_form(call.text)
+        radio_fx = self.config.audio.radio_effects
+        # Same lane, same priority as a real transmission: the frequency is
+        # what these aeroplanes are heard on, and the cabin yields to it the
+        # moment it is asked for rather than once it can be heard.
+        self._radio_renders += 1
+        self.synth.render_soon(
+            lambda: self.synth.speak(spoken, radio=radio_fx, **args),
+            on_done=lambda tr, err: self._traffic_spoken(tr, err, call),
+            priority=0)
+
+    def _traffic_spoken(self, transmission, error, call) -> None:
+        """An AI transmission back from the lane: put it on the player."""
+        self._radio_renders = max(0, self._radio_renders - 1)
+        if error is not None:
+            log.debug("traffic synthesis failed", exc_info=error)
+            return
+        if transmission is None:
             return
         self.player.play(transmission.audio, transmission.sample_rate,
                          label=call.speaker)
@@ -5457,8 +5495,11 @@ class Engine:
         a property because the cabin is handed it as a callable: the crew are
         given a way to ask, not a reference to the engine.
         """
+        # A render submitted but not yet on the player counts too: the gap
+        # between asking for a transmission and hearing it is still one the
+        # cabin must not talk over.
         return bool(self.player.busy or self.microphone.recording
-                    or self._busy.locked())
+                    or self._busy.locked() or self._radio_renders)
 
     def quiet_enough(self) -> bool:
         """Whether an unprompted transmission can go out now.

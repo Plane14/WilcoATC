@@ -36,7 +36,9 @@ hit.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
+import queue
 import re
 import threading
 import time
@@ -131,6 +133,67 @@ class Synthesizer:
         self._cache_size = cache_size
         self._effects: dict[int, RadioEffect] = {}
         self._fell_back = False
+        # Every rendering through one worker. The engines do not share a
+        # lock between them, so two callers rendering at once is the one
+        # thing they cannot be asked to do -- and a CPU render is seconds,
+        # so one on the situation loop is a second-long hole in every part
+        # of the program that has nothing to do with speech. The queue is
+        # priority first: a controller answering a pilot is never queued
+        # behind a safety demonstration.
+        self._render_jobs: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._render_done: "queue.Queue" = queue.Queue()
+        self._render_seq = itertools.count()
+        self._render_thread = threading.Thread(
+            target=self._render_lane, daemon=True, name="wilcoatc-render")
+        self._render_thread.start()
+
+    # ------------------------------------------------------------------
+    # the render lane
+    # ------------------------------------------------------------------
+
+    def render_soon(self, job, on_done, priority: int = 1) -> None:
+        """Render ``job`` on the lane's own thread, never the caller's.
+
+        ``job`` is a zero-argument callable that returns whatever it renders
+        (ordinarily a :meth:`speak` call); ``on_done`` is given
+        ``(result, error)`` back on the thread that runs
+        :meth:`drain_renders` -- the situation loop -- so the work a render
+        finishes in stays off the loop, and the bookkeeping that follows it
+        stays on. Priority is lower-is-sooner and the radio is ``0``: cabin
+        announcements queue behind the frequency, not ahead of it.
+        """
+        self._render_jobs.put((priority, next(self._render_seq),
+                               job, on_done))
+
+    def _render_lane(self) -> None:
+        while True:
+            _prio, _seq, job, on_done = self._render_jobs.get()
+            try:
+                result, error = job(), None
+            except Exception as exc:
+                result, error = None, exc
+            self._render_done.put((on_done, result, error))
+            self._render_jobs.task_done()
+
+    def drain_renders(self) -> None:
+        """Run the finished renders' ``on_done`` calls, on this thread.
+
+        Called once a pass by the situation loop. Everything the finish
+        touches -- the event stream, the player, a pending line's rendered
+        voice -- is only ever handled from that loop, so a callback here is
+        the same code in the same place as the render used to end in; what
+        changed is only where the seconds went.
+        """
+        while True:
+            try:
+                on_done, result, error = self._render_done.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                on_done(result, error)
+            except Exception:
+                log.debug("a render's on_done raised", exc_info=True)
+            self._render_done.task_done()
 
     # ------------------------------------------------------------------
 

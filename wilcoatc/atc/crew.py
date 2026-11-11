@@ -245,6 +245,16 @@ class _Pending:
     # transmission carries a numpy array, and two of those do not answer
     # ``==`` with a yes or a no.
     voice: object = field(default=None, compare=False)
+    # A render already asked of the lane and not yet back. Seconds of work
+    # happen off the situation loop now, so this is what stops ``_prepare``
+    # asking for the same line every pass while the first ask is still
+    # being spoken into a waveform.
+    rendering: bool = field(default=False, compare=False)
+    # The lane tried and the synthesiser said no. Read by the drain as
+    # "drop the line" rather than as "wait longer": a render that failed
+    # once fails every time, and asking again is a nine-second delay on
+    # every line for the rest of the flight.
+    failed: bool = field(default=False, compare=False)
     # After this, a callout is not worth saying (immersion.first_officer
     # .callout_late_s past the moment it was queued for). Zero for a line
     # that keeps. Set from the clock when it is queued, so a queue wound on
@@ -430,6 +440,8 @@ class CrewDirector:
         # Said once per session: a synthesiser that cannot render a crew line
         # will not render the next one either.
         self._render_reported = False
+        # The failure a lane render left behind, for _rendered to report.
+        self._last_render_error = None
         # Which (cue, reason) pairs have already been written down, so a
         # refusal that is true on every pass of the situation loop is one row
         # rather than four a second.
@@ -1709,6 +1721,22 @@ class CrewDirector:
             return
         if due.recording is not None:
             spoken_s = self.play(due.recording, due.line.who)
+        elif due.failed:
+            CREW.write("line", said=False, cue=due.cue, text=due.line.text,
+                       why="the synthesiser could not render it")
+            spoken_s = 0.0
+        elif due.voice is None:
+            # The render is on the lane, or is about to be asked for: the
+            # line goes back and waits rather than the loop going to the
+            # synthesiser for the seconds a render takes. The floor stays
+            # where it was set when the line was taken -- an announcement
+            # whose first paragraph is still being made is still the
+            # announcement that has begun.
+            with self._lock:
+                due.at = time.monotonic() + 0.25
+                self.state.queue.append(due)
+            self._prepare()
+            return
         else:
             spoken_s = (self.say(due.line, due.voice, shown=False)
                         if due.cue == "radio_call"
@@ -1786,11 +1814,12 @@ class CrewDirector:
     def _prepare(self) -> None:
         """Render the next line before it is due.
 
-        On this thread rather than a worker. Every other call into the
-        synthesiser is made from the situation loop, and one cabin
-        announcement is not a reason to make it an object two threads share.
-        The work is the work :meth:`say` would have done anyway, moved to
-        while the speaker is busy or the next line is still a few seconds off.
+        On the synthesiser's lane rather than this thread. A CPU render is
+        seconds, and the pass that used to spend them here froze everything
+        the loop owes a look at -- the pushback watch, the radio, the rest
+        of the cabin queue -- while it worked. The submission is all that
+        happens in-line now; the transmission arrives back through
+        ``drain_renders`` and lands on the pending it was made for.
         """
         if not self.enabled:
             return
@@ -1800,7 +1829,8 @@ class CrewDirector:
             # and the one after it. Rendering the whole announcement the
             # moment it is queued would be several seconds of work done well
             # before anybody needs it, for lines the flight may yet drop.
-            if sum(1 for p in self.state.queue if p.voice is not None) >= 2:
+            if sum(1 for p in self.state.queue
+                   if p.voice is not None or p.rendering) >= 2:
                 return
             # Whoever holds the floor comes next whatever the clock says, so
             # that is whose line is rendered. Without it the render went to
@@ -1811,7 +1841,8 @@ class CrewDirector:
             floor = self._floor()
             nxt = None
             for pending in self.state.queue:
-                if pending.recording is not None or pending.voice is not None:
+                if (pending.recording is not None or pending.voice is not None
+                        or pending.rendering or pending.failed):
                     continue
                 # Not a line that is only waiting to find out whether it is
                 # worth saying. A callout the flight has overtaken is dropped
@@ -1822,14 +1853,41 @@ class CrewDirector:
                 if nxt is None or ((pending.cue != floor, pending.at)
                                    < (nxt.cue != floor, nxt.at)):
                     nxt = pending
+            if nxt is not None:
+                nxt.rendering = True
         if nxt is None:
             return
-        voice = self._render(nxt.line)
-        if voice is not None:
-            # Set on the object rather than back into the queue. A line
-            # dropped while it was being rendered is a line nobody will ever
-            # look at again, so nothing has to be put back.
-            nxt.voice = voice
+        self.synth.render_soon(
+            lambda: self._render(nxt.line),
+            on_done=lambda voice, error: self._rendered(nxt, voice, error),
+            priority=1)
+
+    def _rendered(self, pending: "_Pending", voice, error) -> None:
+        """A lane render back on the loop: hang it on the line it is for.
+
+        Set on the object rather than back into the queue. A line dropped
+        while it was being rendered is a line nobody will ever look at
+        again, so nothing has to be put back.
+        """
+        failed = error is not None or voice is None
+        with self._lock:
+            pending.rendering = False
+            if failed:
+                pending.failed = True
+            else:
+                pending.voice = voice
+        if failed and not self._render_reported:
+            # Loudly, and once. A synthesiser that cannot render one crew
+            # line will not render the next one either, so this is the whole
+            # cabin for the rest of the flight rather than one lost
+            # announcement.
+            self._render_reported = True
+            exc = error if error is not None \
+                else getattr(self, "_last_render_error", "unknown error")
+            self.emit("error",
+                      f"The crew cannot be synthesised, so the cabin is "
+                      f"silent. The radio is unaffected. ({exc})",
+                      key="log.crew_no_voice", detail=str(exc))
 
     def _close_up(self, spoken: _Pending, spoken_s: float) -> None:
         """Move the rest of the announcement up behind what was just said.
@@ -1956,16 +2014,15 @@ class CrewDirector:
                        why=f"the synthesiser raised: {exc}",
                        voice=self._voice_for(position),
                        language=self._language)
-            if not self._render_reported:
-                self._render_reported = True
+            # The word reaches the pilot from _rendered, which is where
+            # every emit now lives: this may be running on the render lane,
+            # and the event stream belongs to the situation loop.
+            self._last_render_error = exc
+            if self._render_reported:
+                log.debug("crew synthesis failed again: %s", exc)
+            else:
                 log.warning("the crew cannot be synthesised: %s", exc,
                             exc_info=True)
-                self.emit("error",
-                          f"The crew cannot be synthesised, so the cabin is "
-                          f"silent. The radio is unaffected. ({exc})",
-                          key="log.crew_no_voice", detail=str(exc))
-            else:
-                log.debug("crew synthesis failed again: %s", exc)
             return None
 
     def say(self, line: Line, voice=None, shown: bool = True) -> float:
