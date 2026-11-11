@@ -1058,6 +1058,11 @@ class AutonomousFlight:
         # only changed by a handoff.
         if state.on_ground:
             self._tune_for_phase(state, session, now)
+            # The calls the flight cannot be moved without: taxi once off
+            # the stand, ready-for-departure at the hold. Nobody issues
+            # an instruction to a flight that never asked, which is how
+            # the aeroplane sat on the ramp until the taxi watchdog bit.
+            self._work_the_calls(state, session, now)
 
         # A new airborne station is checked in with: the level, and
         # whether it is being climbed or descended to. Ground positions
@@ -1076,6 +1081,42 @@ class AutonomousFlight:
                 and now - self.state.last_radio_at >= 4.0 \
                 and self._fo_say("check_in"):
             self.state.checked_in_with = key
+
+    def _work_the_calls(self, state, session, now: float) -> None:
+        """Ask for the thing the phase is waiting on.
+
+        A controller only answers a call that was made: taxi is asked of
+        ground once the aeroplane is off the stand, and ready-for-
+        departure is asked of the tower at the hold. On a broadcast
+        frequency the call is itself the announcement and nobody is
+        expected to answer, but the asking is still how the flight's
+        intentions get onto the frequency. A call is repeated while it
+        goes unanswered -- the frequency can be too busy to have heard
+        the first one -- and ``last_radio_at`` is what keeps that a
+        request and not a stream.
+        """
+        phase = self.state.phase
+        if phase == AutonomousPhase.TAXI_OUT:
+            if session.phase in (Phase.TAXI_OUT, Phase.HOLDING_SHORT,
+                                 Phase.LINED_UP, Phase.TAKEOFF) \
+                    or getattr(session, "taxi_path", None):
+                return
+            kind = "taxi"
+        elif phase == AutonomousPhase.HOLDING_SHORT:
+            if session.lined_up or session.cleared_takeoff \
+                    or session.phase in (Phase.LINED_UP, Phase.TAKEOFF):
+                return
+            if (state.ground_speed_kt or 0.0) > 1.0:
+                # Ready-for-departure is called from a stopped aeroplane.
+                return
+            kind = "ready"
+        else:
+            return
+        tried = getattr(self, "_call_tried_at", 0.0)
+        if now - max(self.state.last_radio_at, tried) < 25.0:
+            return
+        self._call_tried_at = now
+        self._fo_say(kind)
 
     def _tune_for_phase(self, state, session, now: float) -> None:
         """COM1 on the position the ground phase is worked through."""
@@ -1493,6 +1534,27 @@ class AutonomousFlight:
                 or self.session.phase in (Phase.LINED_UP, Phase.TAKEOFF):
             if not self._departure_possible(state):
                 return
+            self._transition(AutonomousPhase.LINE_UP)
+            return
+
+        # On a broadcast frequency nobody answers: the first officer's
+        # "ready" call was the announcement, and the pilot approves the
+        # departure themselves once it has had time to go out and any
+        # final to be looked at. ``cleared_takeoff`` is the state
+        # machine's name for "the runway may be taken", and on CTAF the
+        # person granting that is the one flying.
+        station = getattr(self.session, "current_station", None)
+        if getattr(station, "position", "") in (
+                "CTAF", "UNICOM", "INFO", "AFIS", "RDO") \
+                and self.state.last_radio_at >= self.state.phase_entered_at \
+                and now - self.state.phase_entered_at > 20.0:
+            if not self._departure_possible(state):
+                return
+            self.session.cleared_takeoff = True
+            self.session.cleared_takeoff_at = now
+            self._emit("info",
+                       "No tower on this frequency; departing after "
+                       "self-announcement", "autonomous.depart.broadcast")
             self._transition(AutonomousPhase.LINE_UP)
 
     def _departure_possible(self, state) -> bool:
@@ -2380,15 +2442,32 @@ class AutonomousFlight:
                 return
 
     def _taxi_without_path(self, state, outbound: bool) -> None:
-        """No simulator taxiway route: fly the runway heading, hold short."""
+        """No simulator taxiway route: steer at the runway, hold short."""
         if outbound:
             self._find_runway(state)
-            if self.state.runway_heading > 0:
-                self._steer(state, self.state.runway_heading,
-                            self.performance.taxi_kt)
             if self.session.cleared_takeoff or self.session.phase in (
                     Phase.HOLDING_SHORT, Phase.LINED_UP, Phase.TAKEOFF):
                 self._transition(AutonomousPhase.LINE_UP)
+                return
+            if self.state.runway_heading <= 0:
+                return
+            rwy_lat = self.state.runway_lat
+            rwy_lon = self.state.runway_lon
+            if rwy_lat and rwy_lon:
+                # A heading is not a route: the runway's bearing from
+                # where the aeroplane sits is what reaches it, and the
+                # threshold itself is what it holds short of. ``hold_point``
+                # does the stopping and the move to HOLDING_SHORT, the
+                # same end a planned route arrives at.
+                if state.distance_to(rwy_lat, rwy_lon) * 1852.0 <= 90.0:
+                    self._goto_sub("hold_point")
+                    return
+                hdg = auto_nav.bearing_deg(state.latitude, state.longitude,
+                                           rwy_lat, rwy_lon)
+                self._steer(state, hdg, self.performance.taxi_kt)
+            else:
+                self._steer(state, self.state.runway_heading,
+                            self.performance.taxi_kt)
         else:
             # Inbound with no route yet: the tower has not said where to
             # park, so the aeroplane finishes its rollout and waits --
