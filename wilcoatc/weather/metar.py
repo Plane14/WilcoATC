@@ -79,6 +79,14 @@ _RE_ALTIM_IN = re.compile(r"\bA(\d{4})\b")
 _RE_ALTIM_HPA = re.compile(r"\bQ(\d{4})\b")
 _RE_CLOUD = re.compile(r"\b(FEW|SCT|BKN|OVC|VV)(\d{3})(CB|TCU)?\b")
 _RE_TIME = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
+# A METAR present-weather group: intensity and/or descriptors then the
+# phenomenon itself, token-shaped. Vicinity (VC) and recent (RE) groups
+# are kept too -- a storm ten miles off still counts as the weather.
+_RE_WX = re.compile(
+    r"(?<!\S)(?:VC\b|[-+]?(?:TS|SH|FZ|MI|PR|BC|DR|BL)"
+    r"(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS)+"
+    r"|[-+]?(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS)"
+    r"(?!/))")
 
 CLOUD_WORDS = {
     "FEW": "few clouds at",
@@ -142,11 +150,15 @@ def parse_metar(raw: str) -> Weather:
             wx.altimeter_inhg = inhg_from_hpa(wx.qnh_hpa)
 
     clouds: list[tuple[str, int]] = []
-    for cover, height, _kind in _RE_CLOUD.findall(body):
+    for cover, height, kind in _RE_CLOUD.findall(body):
         clouds.append((cover, int(height) * 100))
+        if kind:
+            wx.cb = True
     if "CLR" in body or "SKC" in body or "NCD" in body or "NSC" in body:
         clouds = []
     wx.clouds = sorted(clouds, key=lambda c: c[1])
+
+    wx.present = " ".join(_RE_WX.findall(body))
 
     return wx
 
@@ -512,6 +524,8 @@ def merge_weather(sim: Weather | None, real: WeatherSample,
         temperature_c=temperature,
         dewpoint_c=dewpoint,
         clouds=real.weather.clouds,
+        present=real.weather.present,
+        cb=real.weather.cb,
         raw=real.weather.raw,
         wind_from=dict.fromkeys(("direction", "speed", "gust"),
                                 "sim" if use_sim_wind else observed),

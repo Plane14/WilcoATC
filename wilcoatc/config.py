@@ -1659,6 +1659,11 @@ class ImmersionConfig:
     # fuel held for the missed approach, the flight to the alternate and
     # the hold there, on top of trip fuel -- as dispatch requires.
     autonomous_divert_reserve_min: float = 45.0
+    # Whether the First Officer reacts to the weather as a crew would:
+    # wind limits at the hold and on final, the gust additive on the
+    # approach speed, icing protection in cloud, convective delays, and
+    # a go-around -- then a diversion -- when the destination is out.
+    autonomous_weather: bool = True
     # Whether to use the simulator's AI pilot (AI Control) for parts of the
     # flight the First Officer doesn't explicitly manage. Off by default
     # because it conflicts with explicit autopilot control.
@@ -1748,6 +1753,8 @@ describe(
     autonomous_divert_reserve_min=Setting(min=15, max=120, step=5, unit="min",
                                           label="set.autonomous_reserve",
                                           help="set.autonomous_reserve_why", **_AUTONOMOUS),
+    autonomous_weather=Setting(label="set.autonomous_weather",
+                               help="set.autonomous_weather_why", **_AUTONOMOUS),
     autonomous_use_sim_ai=Setting(label="set.autonomous_use_sim_ai",
                                   help="set.autonomous_use_sim_ai_why", **_AUTONOMOUS),
 )

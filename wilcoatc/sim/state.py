@@ -190,6 +190,25 @@ class AircraftState:
     ambient_visibility_m: float = 16000.0
     ambient_humidity_pct: float = 60.0
     sea_level_pressure_hpa: float = 1013.25
+    # What the weather is doing to the airframe, as the sim renders it:
+    # in cloud or not, what is falling, how much ice the airframe has
+    # picked up, and the temperature the probe sees moving -- TOTAL AIR
+    # TEMPERATURE is warmer than ambient at speed, which is exactly the
+    # figure an icing call wants.
+    ambient_in_cloud: bool = False
+    ambient_precip_state: int = 0      # AMBIENT PRECIP STATE bitmask
+    structural_ice_pct: float = 0.0    # STRUCTURAL ICE PCT
+    total_air_temperature_c: float = 15.0
+    # The wind in the aeroplane's own axes, knots: X lateral (the
+    # crosswind component on the nose), Y vertical (an up or downdraft is
+    # the only convective evidence the sim publishes), Z longitudinal
+    # (headwind +, tailwind -).
+    aircraft_wind_x_kt: float = 0.0
+    aircraft_wind_y_kt: float = 0.0
+    aircraft_wind_z_kt: float = 0.0
+    # PRESSURE ALTITUDE in feet: the density altitude's coarse part, which
+    # with the temperature is the whole of "hot and high".
+    pressure_altitude_ft: float = 0.0
 
     # --- bookkeeping ---
     timestamp: float = field(default_factory=time.monotonic)

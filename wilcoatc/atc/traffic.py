@@ -382,6 +382,17 @@ _LANDING_TRAFFIC: dict[str, str] = {
 }
 
 
+# "windshear reported", which is why you are going around.
+_WINDSHEAR: dict[str, str] = {
+    "en": "windshear reported",
+    "fr": "cisaillement de vent signalé",
+    "es": "cizalladura reportada",
+    "de": "Windscherung gemeldet",
+    "it": "segnalato windshear",
+    "pt": "windshear reportado",
+}
+
+
 def article(make: str, language: str = "en") -> str:
     """``"Airbus"`` -> ``"the Airbus"``, ``"l'Airbus"``, ``"il Boeing"``."""
     if not make:
@@ -407,6 +418,11 @@ def runway_traffic(language: str = "en") -> str:
     is a conversation for afterwards.
     """
     return _RUNWAY_TRAFFIC.get(language, _RUNWAY_TRAFFIC["en"])
+
+
+def windshear(language: str = "en") -> str:
+    """Why an aircraft is going around on a gusty day."""
+    return _WINDSHEAR.get(language, _WINDSHEAR["en"])
 
 
 def make_of(type_code: str) -> str:
@@ -2036,6 +2052,31 @@ class TrafficInjector:
     # making aeroplanes
     # ------------------------------------------------------------------
 
+    # How busy a field really is when the weather is on the ground and
+    # grey: instruments or not, a ceiling or a visibility that low is
+    # fewer movements an hour, not the same ones slightly damper.
+    _IMC_RATE = 0.6
+    # What VFR needs to be legal, roughly: fifteen hundred feet of cloud
+    # base and three miles to see by, the figures a special VFR is issued
+    # under rather than flown over.
+    _VMC_CEILING_FT = 1500
+    _VMC_VIS_SM = 3.0
+
+    def _vmc(self) -> bool:
+        """Whether the field is in visual conditions, on its own report.
+
+        A field that reports nothing is the field it always was; only a
+        report can call the weather bad.
+        """
+        weather = self.field.weather
+        if weather is None or not getattr(weather, "raw", ""):
+            return True
+        if getattr(weather, "visibility_sm", 10.0) < self._VMC_VIS_SM:
+            return False
+        ceiling = min((h for cover, h in getattr(weather, "clouds", [])
+                       if cover in ("BKN", "OVC", "VV")), default=None)
+        return ceiling is None or ceiling >= self._VMC_CEILING_FT
+
     def _wanted(self) -> int:
         """How many invented aeroplanes this field should have.
 
@@ -2045,8 +2086,12 @@ class TrafficInjector:
         not want a second one invented on top of it; but a field with two
         real aeroplanes on it is still a quiet field, so the invented traffic
         fills the rest rather than standing down the moment anything is seen.
+
+        And less when the weather is down: an IMC rate is not the VMC one.
         """
         wanted = sum(self._room().values())
+        if not self._vmc():
+            wanted = int(round(wanted * self._IMC_RATE))
         if self.max_invented is not None:
             wanted = min(wanted, self.max_invented)
         return wanted
@@ -2112,7 +2157,12 @@ class TrafficInjector:
         """Seconds between one aeroplane starting and the next."""
         base = (kind.movement_gap_s if kind is not None and kind.movement_gap_s
                 else 55.0)
-        return base / max(0.25, self.density)
+        gap = base / max(0.25, self.density)
+        # Long finals and careful taxiing in the murk: a tower works the
+        # same rules with bigger gaps when nobody can see far.
+        if not self._vmc():
+            gap *= 1.4
+        return gap
 
     def _booked(self) -> int:
         """Departures booked off the apron, not yet moving. They are in play
@@ -2262,8 +2312,10 @@ class TrafficInjector:
         booked = [f for f in self.statics if f.boarding_at]
         if len(booked) >= self.MAX_BOARDING:
             return True
+        vmc = self._vmc()
         ready = [f for f in self.statics
-                 if (f.drawn or not self.requires_sim) and not f.boarding_at]
+                 if (f.drawn or not self.requires_sim) and not f.boarding_at
+                 and (f.ifr or vmc)]
         if not ready:
             return bool(booked)
         flight = self.random.choice(ready)
@@ -2272,8 +2324,16 @@ class TrafficInjector:
 
     def _work_the_boarding(self, now: float) -> None:
         """Start the boarding that is due, and send the boarded off."""
+        vmc = self._vmc()
         for flight in list(self.statics):
             if not flight.boarding_at:
+                continue
+            if not flight.ifr and not vmc:
+                # Booked in visual conditions and the field went down
+                # under it: the passengers are sent home, and the
+                # aeroplane stays where it is parked.
+                flight.boarding_at = 0.0
+                flight.boarding = False
                 continue
             if not flight.boarding and now >= flight.boarding_at:
                 flight.boarding = True
@@ -2292,8 +2352,10 @@ class TrafficInjector:
         schedule booked; without it, one is chosen now.
         """
         if flight is None:
+            vmc = self._vmc()
             ready = [f for f in self.statics
-                     if f.drawn or not self.requires_sim]
+                     if (f.drawn or not self.requires_sim)
+                     and (f.ifr or vmc)]
             if not ready:
                 return None
             flight = self.random.choice(ready)
@@ -2378,6 +2440,14 @@ class TrafficInjector:
         flight = self._new_flight(now, arriving=False, parked=False)
         if flight is None:
             return None, "no_callsign"
+        if not flight.ifr and not self._vmc():
+            # The pilot asked for a departure and the field is in the
+            # clouds: what launches is on a clearance, not circuits.
+            flight.ifr = True
+            flight.pattern_work = False
+            flight.squawk = f"{self.random.randint(1000, 7777):04d}" \
+                .replace("8", "5").replace("9", "6")
+            self._assign_route(flight, arriving=False)
         flight.sequence = 0
         legs = self._legs_from_the_ramp(flight)
         if not free:
@@ -2689,15 +2759,23 @@ class TrafficInjector:
                       and operator.fleet == livemod.FREIGHT
                       else livemod.AIRLINE if airline_field else livemod.GA),
         )
+        if not flight.ifr and (arriving or parked) and not self._vmc():
+            # A VFR aeroplane does not fly in this: the field is under
+            # its own ceiling and the light ones are staying home. The
+            # parked ones may stand there -- it is the flying that the
+            # weather stops.
+            return None
         if not flight.ifr:
             # A VFR flight squawks the conspicuity code, which is regional, and
             # is given one by nobody: it sets it before it starts the engine.
             flight.squawk = self._phrase(language).vfr_squawk
             # A business jet comes and goes; the circuit share is the
-            # field's (wilcoatc.atc.fleet).
+            # field's (wilcoatc.atc.fleet) -- and nobody does circuits in
+            # the clouds at all.
             kind = self.field.kind
             share = kind.circuit_share if kind is not None else CIRCUIT_SHARE
             flight.pattern_work = (type_code not in fleets.BUSINESS
+                                   and self._vmc()
                                    and self.random.random() < share)
             # And it comes from, or goes to, a field near this one, not Nice.
             flight.origin = self._nearby_field() or flight.origin
@@ -4856,6 +4934,42 @@ class TrafficInjector:
         return (abs(across) * 1852.0 > self.STABLE_ACROSS_M
                 or off > self.STABLE_HEADING_DEG)
 
+    def _weather_go_around(self, flight: Flight) -> bool:
+        """Whether this approach ends for the weather.
+
+        Rolled once for an approach, not watched every tick: a gusty day
+        does not send everybody around, it sends the one whose luck came
+        in -- a spread of ten knots and more between the wind and its
+        gusts, which a light aeroplane baulks at oftener than a heavy
+        one, or a ceiling under three hundred feet, which is under what
+        anybody lands out of. A field that does not report sends nobody
+        around: weather cannot be bad until it is known to be.
+        """
+        if getattr(flight, "weather_ga_done", False):
+            return False
+        weather = self.field.weather
+        if weather is None or not getattr(weather, "raw", ""):
+            return False
+        roll = getattr(flight, "weather_ga_roll", None)
+        if roll is None:
+            roll = self.random.random()
+            flight.weather_ga_roll = roll
+        gust = float(getattr(weather, "gust_kt", 0.0) or 0.0)
+        wind = float(getattr(weather, "wind_kt", 0.0) or 0.0)
+        if gust - wind >= 10.0:
+            light = getattr(flight.performance, "approach_kt", 130.0) < 110
+            chance = 0.35 if light else 0.12
+        else:
+            chance = 0.0
+        ceiling = min((h for cover, h in getattr(weather, "clouds", [])
+                       if cover in ("BKN", "OVC", "VV")), default=None)
+        if ceiling is not None and ceiling < 300:
+            chance = max(chance, 0.5)
+        if roll < chance:
+            flight.weather_ga_done = True
+            return True
+        return False
+
     def _watch_final(self, flight: Flight, now: float) -> None:
         """An aeroplane on short final to a runway that may not be free."""
         if flight.phase != "final" or flight.on_ground:
@@ -4864,6 +4978,20 @@ class TrafficInjector:
                 and not self._unstable(flight)):
             return
         if self._already_told(flight, "go_around"):
+            return
+        if not flight.observed and self._weather_go_around(flight):
+            # The weather sent it: a gust spread the pilot did not like,
+            # or the field gone under the cloud before the threshold.
+            # Rolled once per approach in _weather_go_around, and said by
+            # the crew, the way a windshear call comes from the aeroplane.
+            self._exchange(
+                flight, now, "TWR",
+                pilot_first=lambda p, a, s: p.going_around(a),
+                controller=lambda c, a, s: c.go_around(
+                    a, reason=windshear(flight.language)),
+                command=("go_around", {}),
+                urgent=True,
+            )
             return
         if not flight.observed and self._unstable(flight):
             # Not lined up with the runway by now, and a crew does not land

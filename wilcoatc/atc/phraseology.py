@@ -222,6 +222,13 @@ class Weather:
     temperature_c: float = 15.0
     dewpoint_c: float = 10.0
     clouds: list[tuple[str, int]] = field(default_factory=list)  # [("FEW", 4500)]
+    # The METAR's present-weather group, kept whole ("TSRA", "-FZRA"): the
+    # codes are only ever read together, and pulling a lone one apart to
+    # rejoin it later loses what it said.
+    present: str = ""
+    # Any cloud layer tagged CB or TCU -- the convective signpost that was
+    # parsed out of the METAR and, until now, thrown away.
+    cb: bool = False
     remarks: str = ""
     raw: str = ""
     # Magnetic variation at the field, east positive. ``wind_dir`` stays true,

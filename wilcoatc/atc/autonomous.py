@@ -27,7 +27,9 @@ support the aircraft type and have ground services (fuel, parking, etc.).
 from __future__ import annotations
 
 import logging
+import math
 import random
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -233,6 +235,20 @@ class AutonomousState:
     flap_gate_warned: bool = False
     minimum_fuel_said: bool = False
     depart_fuel_warned: bool = False
+    # What the weather has already been reacted to: the wind that held a
+    # departure, the icing the systems were turned on for, the rough air
+    # the speed was pulled back through, the approach conditions that
+    # sent the flight around, and how many times the weather won.
+    wind_hold_said: bool = False
+    wind_hold_since: float = 0.0
+    convective_hold_said: bool = False
+    icing_said: bool = False
+    ice_warned: bool = False
+    turbulence_until: float = 0.0
+    turbulence_said: bool = False
+    windshear_since: float = 0.0
+    weather_gas: int = 0
+    weather_ga_active: bool = False
     # Timing
     last_action_at: float = 0.0
 
@@ -282,6 +298,10 @@ class AutonomousFlight:
             config.immersion, "autonomous_service_turnaround", True)
         self._reserve_min = float(getattr(
             config.immersion, "autonomous_divert_reserve_min", 45.0) or 45.0)
+        # Whether the weather is reacted to at all. Off, the FO flies the
+        # leg it was given whatever falls out of the sky on it.
+        self._weather_reactions = getattr(
+            config.immersion, "autonomous_weather", True)
         # The biggest fuel_total_gal the model has ever shown: the
         # capacity for a model that declares no FUEL TOTAL CAPACITY.
         self._fuel_capacity_seen = 0.0
@@ -298,6 +318,9 @@ class AutonomousFlight:
         self._speeds: Optional[vspeeds.Speeds] = None
         self._fuel_known = False
         self._ga_flag_seen = False
+        # The last few headwind samples on final, for the windshear
+        # swing the watch works off.
+        self._wind_z_hist: list = []
         self._last_state = None
         # The throttle servo's last commanded lever position, 0..1.
         self._last_lever = 0.0
@@ -606,6 +629,10 @@ class AutonomousFlight:
         # whatever it flies, so they run from here either way.
         self._manage_comms(state, now)
         self._drive_checklist(state, now)
+        # The weather watch is a FO's job whatever is flown, like the
+        # radios: a helicopter ices and is blown around as an aeroplane
+        # does. The go-around parts are the fixed-wing phases' own.
+        self._monitor_weather(state, now)
         if self._heli is not None:
             self._heli.tick(state)
             return
@@ -695,14 +722,25 @@ class AutonomousFlight:
                 or self.session.cruise_altitude_ft
                 or self.session.initial_altitude_ft or 0.0)
 
+    def _penetration_kt(self, state) -> float:
+        """The speed rough air is ridden out at: a margin off the red
+        line and off the stall, the way the books write it."""
+        cruise = self.performance.cruise_kt or 200.0
+        lim = self._limits(state)
+        pen = cruise * 0.75
+        if lim["stall_kt"] > 0.0:
+            pen = max(pen, lim["stall_kt"] * 1.5)
+        return max(60.0, min(pen, lim["max_ias_kt"]))
+
     def _speed_target(self, state) -> float:
+        target = 0.0
         if self.session.assigned_speed_kt:
-            return self.session.assigned_speed_kt
+            target = self.session.assigned_speed_kt
         # In the cruise the model's own estimate of its cruise speed is
         # the best figure there is -- it is this aeroplane's, not a class's
         # -- and the class number is the fallback for a model that
         # declares none.
-        if self.state.phase == AutonomousPhase.CRUISE:
+        elif self.state.phase == AutonomousPhase.CRUISE:
             estimated = float(getattr(state, "estimated_cruise_kt", 0.0)
                               or 0.0)
             if 50.0 < estimated < 600.0:
@@ -712,8 +750,14 @@ class AutonomousFlight:
                                 or 0.0)
                 if redline > 0:
                     estimated = min(estimated, redline * 0.95)
-                return estimated
-        return self.state.climb_kt or self.performance.cruise_kt
+                target = estimated
+        if not target:
+            target = self.state.climb_kt or self.performance.cruise_kt
+        if time.monotonic() < self.state.turbulence_until:
+            # Rough air beats the assignment, the way a crew asks for a
+            # slower speed rather than ride it out at it.
+            target = min(target, self._penetration_kt(state))
+        return target
 
     def _apply_flight_director(self, state, altitude: float = 0.0,
                              vs_fpm: float = 0.0, heading: float = -1.0,
@@ -1443,6 +1487,8 @@ class AutonomousFlight:
             self._emit("info",
                        f"Runway {have:.0f} ft for a suggested {need:.0f} "
                        "ft takeoff run", "autonomous.limits.runway")
+        if self._weather_reactions and not self._departure_wind_ok(state):
+            return False
         return self._departure_fuel_ok(state)
 
     def _departure_fuel_ok(self, state) -> bool:
@@ -1737,7 +1783,7 @@ class AutonomousFlight:
 
         # Speed: assigned, else a sensible step-down then approach speed.
         speed = self.session.assigned_speed_kt or (
-            (self.state.vapp_kt or self.performance.approach_kt) + 20.0
+            (self._vapp(state)) + 20.0
             if agl < 3000 else self.performance.approach_kt)
         # The descent rate is the model's own where it declares one --
         # a clean turbofan comes down at three thousand, a piston at eight
@@ -2676,7 +2722,7 @@ class AutonomousFlight:
         """Vertical speed and speed for a mode that owns the lateral."""
         self._apply_flight_director(
             state, vs_fpm=self._path_vertical(state, recipe),
-            speed_kt=self.state.vapp_kt or self.performance.approach_kt)
+            speed_kt=self._vapp(state))
 
     def _fly_computed(self, state, recipe) -> None:
         """The computed final: path steering for the lateral, the
@@ -2700,7 +2746,7 @@ class AutonomousFlight:
         self._apply_flight_director(
             state, vs_fpm=self._path_vertical(state, recipe),
             heading=self._magnetic(heading, state),
-            speed_kt=self.state.vapp_kt or self.performance.approach_kt)
+            speed_kt=self._vapp(state))
 
     # -- circling -----------------------------------------------------------
 
@@ -2785,7 +2831,7 @@ class AutonomousFlight:
         self._apply_flight_director(
             state, altitude=int(target), vs_fpm=vs,
             heading=self._magnetic(heading, state),
-            speed_kt=(self.state.vapp_kt or self.performance.approach_kt)
+            speed_kt=(self._vapp(state))
             + 5.0)
         return True
 
@@ -2839,7 +2885,7 @@ class AutonomousFlight:
             self.state.configured = "flaps_full"
         d.spoilers_arm(True)
         # Approach speed: Vapp where known, the type's figure otherwise.
-        vapp = self.state.vapp_kt or self.performance.approach_kt
+        vapp = self._vapp(state)
         self.director.speed(vapp)
 
     def _check_stabilized(self, state) -> None:
@@ -2851,7 +2897,7 @@ class AutonomousFlight:
             return
         vs = abs(state.vertical_speed_fpm or 0.0)
         ias = state.indicated_airspeed_kt or 0.0
-        target = self.state.vapp_kt or self.performance.approach_kt
+        target = self._vapp(state)
         bank = abs(getattr(state, "bank_deg", 0.0) or 0.0)
         aligned = True
         if self.state.runway_heading > 0 and state.on_ground is False:
@@ -2877,6 +2923,17 @@ class AutonomousFlight:
         if not flag:
             self._ga_flag_seen = False
         agl = state.altitude_agl_ft or 0.0
+        # The weather's gates, below a thousand feet: the wind past the
+        # limits on this runway, or the field's own report below what the
+        # approach can be flown to. Counted once an approach -- the flag
+        # lifts when the next one is set up.
+        if self._weather_reactions and 0.0 < agl < 1000.0 \
+                and not self.state.weather_ga_active:
+            if self._landing_wind_bad(state) \
+                    or self._weather_below_minima(state):
+                self.state.weather_gas += 1
+                self.state.weather_ga_active = True
+                return True
         # Below minimums without the runway: a go-around, not a dive.
         if agl < (self.state.minima_ft or 200.0) and agl > 0:
             if not self.session.cleared_landing and self.session.ifr:
@@ -2890,7 +2947,7 @@ class AutonomousFlight:
             if bank > 35.0:
                 return True
             ias = state.indicated_airspeed_kt or 0.0
-            target = self.state.vapp_kt or self.performance.approach_kt
+            target = self._vapp(state)
             if target and abs(ias - target) > 20.0:
                 return True
         # Drifting toward the ground without a flare started.
@@ -2963,12 +3020,18 @@ class AutonomousFlight:
                                         vs_fpm=self.performance.climb_fpm,
                                         heading=hdg,
                                         speed_kt=self.state.climb_kt or 180.0)
-        # Once level-ish at the missed altitude, reset for another pass.
+        # Once level-ish at the missed altitude, reset for another pass --
+        # unless the weather sent this one and the one before it, in
+        # which case the destination is out and the alternate gets it.
         alt = state.altitude_ft or 0.0
         if alt >= self.state.missed_alt_ft - 150.0 \
                 and abs(state.vertical_speed_fpm or 0.0) < 300:
             self.state.stabilized = False
             self.state.configured = ""
+            if self.state.weather_gas >= 2 and self._weather_reactions:
+                self._divert_for_weather(state)
+                return
+            self.state.weather_ga_active = False
             self._goto_sub("intercept")
             self._emit("info", "Missed approach complete; setting up again",
                        "autonomous.go_around_done")
@@ -3185,47 +3248,353 @@ class AutonomousFlight:
         if dest is not None:
             self.session.destination = dest
             self.session.ifr = False  # an emergency is flown, not filed
-            self.session.sid = ""
-            self.session.descend_via = ""
-            self.session.star_join = ""
-            self.state.sid_nav = None
-            self.state.star_nav = None
-            self.state.sid_key = ()
-            self.state.star_key = ()
-            self.state.procedure_suspended = ""
-            if self.use_route is not None:
-                try:
-                    from .route import from_string, resolver
-                    route = from_string(
-                        f"DCT {dest.ident}", dest.ident, dest.ident,
-                        resolver(self.navdb))
-                    self.use_route(route)
-                except Exception:
-                    pass
             # An emergency descent: get down to a survivable height now,
             # the approach machinery handles the rest. On final the
             # approach is waved off for the new field, with the cached
             # runway geometry dropped so it resolves again.
-            if self.state.phase in (AutonomousPhase.CLIMB,
-                                    AutonomousPhase.CRUISE,
-                                    AutonomousPhase.DESCENT,
-                                    AutonomousPhase.APPROACH):
-                self.state.runway_heading = 0.0
-                self.state.aligned = False
-                self.state.stabilized = False
-                self.state.configured = ""
-                self.state.minima_ft = 200.0
-                self.state.approach_recipe = None
-                self.state.approach_recipe_tried = False
-                self.state.approach_recipe_key = ()
-                self.state.approach_tuned = False
-                self.state.circling = False
-                self.state.circle_path = []
-                self.state.tod_nm = 0.0
-                self._transition(AutonomousPhase.DESCENT)
-                self._goto_sub("")
+            self._route_diversion()
 
-    def _is_turbine(self, state) -> bool:
+    # -- weather ---------------------------------------------------------------
+
+    def _monitor_weather(self, state, now: float) -> None:
+        """What the weather is doing, answered the way a crew answers it.
+
+        Nothing is invented: the icing call is made on the cloud and the
+        temperature the sim is rendering, the rough air on the wind the
+        airframe is actually in, the wind limits on the same METAR the
+        controllers quote. The departure and approach checks live at the
+        decisions they gate; what is watched here is what the airframe is
+        in, which is nobody's phase to own.
+        """
+        if not self._weather_reactions or self.state.emergency_declared:
+            return
+        self._watch_icing(state, now)
+        self._watch_turbulence(state, now)
+
+    def _watch_icing(self, state, now: float) -> None:
+        """Anti-ice and pitot heat on in visible moisture near freezing.
+
+        TAT is the figure a crew watches -- it is warmer than ambient at
+        speed, which is the same reason an aeroplane ices in cloud that
+        is not strictly below freezing. A model that publishes no switch
+        positions is asked anyway: a write that does not exist does no
+        harm next to one that does.
+        """
+        if state.on_ground:
+            return
+        tat = float(getattr(state, "total_air_temperature_c", 15.0)
+                    or getattr(state, "ambient_temperature_c", 15.0) or 15.0)
+        ambient = float(getattr(state, "ambient_temperature_c", 15.0) or 15.0)
+        moisture = (bool(getattr(state, "ambient_in_cloud", False))
+                    or int(getattr(state, "ambient_precip_state", 0) or 0) > 0)
+        if moisture and -30.0 < min(tat, ambient) < 6.0 \
+                and not self.state.icing_said:
+            self.state.icing_said = True
+            d = self.director
+            d.pitot_heat(True)
+            for index in range(
+                    1, int(getattr(state, "engine_count", 0) or 1) + 1):
+                d.write(f"GENERAL ENG ANTI ICE POSITION:{index}", 1.0)
+            d.write("PROP DEICE SWITCH:1", 1.0)
+            d.write("STRUCTURAL DEICE SWITCH", 1.0)
+            d.write("WINDSHIELD DEICE SWITCH:1", 1.0)
+            self._emit("info", "Icing conditions: anti-ice and pitot "
+                       "heat on", "autonomous.weather.icing")
+        elif not moisture:
+            self.state.icing_said = False
+        # Ice that is accreting anyway is a route problem, not a switch
+        # problem: it is said once so the pilot hears it.
+        ice = float(getattr(state, "structural_ice_pct", 0.0) or 0.0)
+        if ice >= 40.0 and not self.state.ice_warned:
+            self.state.ice_warned = True
+            self._emit("info",
+                       f"Ice accreting on the airframe ({ice:.0f}%): "
+                       "consider leaving this altitude",
+                       "autonomous.weather.ice")
+
+    def _watch_turbulence(self, state, now: float) -> None:
+        """Rough air, as the airframe reports it.
+
+        The vertical wind is the only convective evidence the sim
+        publishes, and it is honest evidence: a ten-knot up or downdraft
+        is a thousand feet a minute. In it the speed is pulled back to
+        the penetration figure; on final a swing of it is a windshear,
+        and a windshear is a go-around, not a recovery attempt.
+        """
+        if state.on_ground:
+            return
+        updraft = abs(getattr(state, "aircraft_wind_y_kt", 0.0) or 0.0)
+        if updraft >= 12.0:
+            self.state.turbulence_until = now + 30.0
+            if not self.state.turbulence_said:
+                self.state.turbulence_said = True
+                self._emit("info",
+                           "Rough air: pulled back toward the turbulence "
+                           "penetration speed",
+                           "autonomous.weather.turbulence")
+        elif now > self.state.turbulence_until:
+            self.state.turbulence_said = False
+
+        # Windshear is the fixed-wing approach's problem: it is the only
+        # phase with the machinery to go around.
+        if self._heli is not None \
+                or self.state.phase != AutonomousPhase.APPROACH:
+            return
+        agl = float(getattr(state, "altitude_agl_ft", 0.0) or 0.0)
+        if not 0.0 < agl < 1500.0:
+            self._wind_z_hist.clear()
+            return
+        # The headwind down final, kept for a few polls: fifteen knots
+        # appearing or vanishing across it is the textbook shear figure.
+        longitudinal = float(getattr(state, "aircraft_wind_z_kt", 0.0) or 0.0)
+        hist = self._wind_z_hist
+        hist.append(longitudinal)
+        del hist[:len(hist) - 8]
+        swing = (max(hist) - min(hist)) if len(hist) >= 4 else 0.0
+        if (swing >= 15.0 or (updraft >= 10.0 and agl < 500.0)) \
+                and now - self.state.windshear_since > 20.0:
+            if self.state.sub in ("intercept", "final"):
+                self.state.windshear_since = now
+                self.state.weather_gas += 1
+                self._emit("info", "Windshear: going around",
+                           "autonomous.weather.windshear")
+                self._start_go_around(state)
+
+    def _field_weather(self, airport):
+        """The weather the controllers are quoting for a field, or None.
+
+        It is the engine's merged figure -- the sim's where the field is
+        close enough to speak for itself, the observation's elsewhere --
+        so the FO's decision matches the wind the tower just read out.
+        """
+        if airport is None:
+            return None
+        weather_for = getattr(self.brain, "weather_for", None)
+        if weather_for is None:
+            return None
+        for ident in (getattr(airport, "icao", "") or "",
+                      getattr(airport, "ident", "") or ""):
+            if not ident:
+                continue
+            try:
+                wx = weather_for(ident)
+            except Exception:
+                continue
+            if wx is not None:
+                return wx
+        return None
+
+    @staticmethod
+    def _convective(weather) -> bool:
+        """Whether the report's sky is convective: a thunderstorm, hail,
+        squall or funnel in the present weather, or a CB in the clouds.
+        The raw body is scanned as well as the parsed group -- ``VCTS``
+        is a token the parser's present-weather list does not keep, and
+        a storm in the vicinity still counts."""
+        if weather is None:
+            return False
+        if getattr(weather, "cb", False):
+            return True
+        text = ((getattr(weather, "raw", "") or "")
+                .split(" RMK", 1)[0].upper())
+        present = getattr(weather, "present", "") or ""
+        if present:
+            text += " " + present.upper()
+        return bool(re.search(r"(?:^|\s)[-+]?(?:VCTS|TS\w*|GR|SQ|FC)",
+                              text))
+
+    def _wind_limits(self) -> tuple[float, float]:
+        """(crosswind, tailwind) in knots this class is demonstrated to.
+
+        Nobody publishes the model's own figures, so they are the class's
+        -- a transport's thirty off the side and fifteen up the tail, a
+        turboprop's twenty-five and ten, a light aircraft's fifteen and
+        ten. A helicopter has no runway wind that matters this way.
+        """
+        if self._is_helicopter:
+            return 99.0, 99.0
+        cruise = float(getattr(self.performance, "cruise_kt", 0.0) or 0.0)
+        if cruise >= 230.0:
+            return 30.0, 15.0
+        if cruise >= 140.0:
+            return 25.0, 10.0
+        return 15.0, 10.0
+
+    @staticmethod
+    def _runway_wind(weather, heading: float) -> tuple[float, float, float]:
+        """(headwind, crosswind, tailwind) in knots on a runway heading.
+
+        The gust is counted, not reported separately: it is the number
+        the airframe sees at the worst moment of the flare. A variable
+        wind is nobody's crosswind -- it is worked as calm, the same way
+        the runway chooser works it.
+        """
+        if weather is None or getattr(weather, "variable", False):
+            return 0.0, 0.0, 0.0
+        wind = max(float(getattr(weather, "wind_kt", 0.0) or 0.0),
+                   float(getattr(weather, "gust_kt", 0.0) or 0.0))
+        if wind < 0.5 or heading <= 0.0:
+            return 0.0, 0.0, 0.0
+        off = math.radians((float(getattr(weather, "wind_dir", 0.0) or 0.0)
+                            - float(heading)) % 360.0)
+        head = wind * math.cos(off)
+        return max(0.0, head), abs(wind * math.sin(off)), max(0.0, -head)
+
+    def _vapp(self, state) -> float:
+        """The approach speed as a crew would fly it: the figure, plus
+        half the gust, capped -- the additive a gusty day asks for, so
+        the speed that is flown covers the speed that gusts."""
+        base = self.state.vapp_kt or self.performance.approach_kt
+        if not base or not self._weather_reactions:
+            return base
+        wx = self._field_weather(self.session.destination)
+        gust = float(getattr(wx, "gust_kt", 0.0) or 0.0)
+        steady = float(getattr(wx, "wind_kt", 0.0) or 0.0)
+        if gust <= steady:
+            return base
+        return base + max(0.0, min((gust - steady) * 0.5, 15.0))
+
+    def _route_diversion(self) -> None:
+        """The destination changed under the flight: the plan filed again
+        direct, the old field's procedures dropped, and the approach
+        machinery reset so the new field is worked out fresh rather
+        than on the old one's numbers."""
+        self.session.sid = ""
+        self.session.descend_via = ""
+        self.session.star_join = ""
+        self.state.sid_nav = None
+        self.state.star_nav = None
+        self.state.sid_key = ()
+        self.state.star_key = ()
+        self.state.procedure_suspended = ""
+        if self.use_route is not None:
+            try:
+                from .route import from_string, resolver
+                dest = self.session.destination
+                route = from_string(
+                    f"DCT {dest.ident}", dest.ident, dest.ident,
+                    resolver(self.navdb))
+                self.use_route(route)
+            except Exception:
+                pass
+        if self.state.phase in (AutonomousPhase.CLIMB,
+                                AutonomousPhase.CRUISE,
+                                AutonomousPhase.DESCENT,
+                                AutonomousPhase.APPROACH):
+            self.state.runway_heading = 0.0
+            self.state.aligned = False
+            self.state.stabilized = False
+            self.state.configured = ""
+            self.state.minima_ft = 200.0
+            self.state.approach_recipe = None
+            self.state.approach_recipe_tried = False
+            self.state.approach_recipe_key = ()
+            self.state.approach_tuned = False
+            self.state.circling = False
+            self.state.circle_path = []
+            self.state.tod_nm = 0.0
+            self.state.weather_gas = 0
+            self.state.weather_ga_active = False
+            self._transition(AutonomousPhase.DESCENT)
+            self._goto_sub("")
+
+    def _departure_wind_ok(self, state) -> bool:
+        """Whether the wind and the cells let the aeroplane go.
+
+        A crosswind or a tailwind the class is not demonstrated for is
+        held for, as a crew holds short for a gusty wind rather than
+        rolling in it; a thunderstorm over the field is waited out. Both
+        are held for twenty minutes, then called -- a wind that is not
+        coming back is a plan that is not flying.
+        """
+        weather = self._field_weather(
+            self.session.departure or self._get_current_airport())
+        if weather is None:
+            return True
+        now = time.monotonic()
+        if self._convective(weather):
+            if not self.state.convective_hold_said:
+                self.state.convective_hold_said = True
+                self.state.wind_hold_since = now
+                self._emit("info",
+                           "Holding departure: thunderstorm at the field",
+                           "autonomous.weather.hold")
+            elif now - self.state.wind_hold_since > 1200.0:
+                self._set_error("Thunderstorm over the field for twenty "
+                                "minutes; not departing into it")
+            return False
+        _head, cross, tail = self._runway_wind(
+            weather, self.state.runway_heading)
+        xlim, tlim = self._wind_limits()
+        if cross > xlim or tail > tlim:
+            if not self.state.wind_hold_said:
+                self.state.wind_hold_said = True
+                self.state.wind_hold_since = now
+                self._emit(
+                    "info",
+                    f"Holding departure: {cross:.0f} kt crosswind, "
+                    f"{tail:.0f} kt tailwind (limits {xlim:.0f}/"
+                    f"{tlim:.0f})", "autonomous.weather.hold")
+            elif now - self.state.wind_hold_since > 1200.0:
+                self._set_error("Departure wind beyond limits and not "
+                                "improving")
+            return False
+        self.state.wind_hold_said = False
+        return True
+
+    def _landing_wind_bad(self, state) -> bool:
+        """Whether the wind on the landing runway is past the limits."""
+        if not self.state.runway_heading:
+            return False
+        weather = self._field_weather(self.session.destination)
+        _head, cross, tail = self._runway_wind(
+            weather, self.state.runway_heading)
+        xlim, tlim = self._wind_limits()
+        return cross > xlim or tail > tlim
+
+    def _weather_below_minima(self, state) -> bool:
+        """Whether the field's own report puts the approach out: the
+        ceiling under the minima, or the visibility under what the
+        approach can be flown to. A field that does not report is not a
+        field below minima -- only a report can say that."""
+        weather = self._field_weather(self.session.destination)
+        if weather is None or not getattr(weather, "raw", ""):
+            return False
+        ceiling = min((h for cover, h in getattr(weather, "clouds", [])
+                       if cover in ("BKN", "OVC", "VV")), default=None)
+        minima = float(self.state.minima_ft or 200.0)
+        if ceiling is not None and ceiling + 50.0 < minima:
+            return True
+        recipe = self.state.approach_recipe
+        floor_sm = 1.5 if getattr(recipe, "circling", False) else (
+            0.75 if getattr(recipe, "family", "") in ("ils", "rnav")
+            else 1.0)
+        return float(getattr(weather, "visibility_sm", 10.0)
+                     or 10.0) < floor_sm
+
+    def _divert_for_weather(self, state) -> None:
+        """Two attempts at a destination the weather keeps shutting: the
+        alternate gets the flight instead, said like a pilot would."""
+        dest = self._pick_alternate(state)
+        if dest is None:
+            self.state.weather_gas = 0
+            self._emit("error",
+                       "Destination weather below limits and no alternate "
+                       "in reach; trying the approach again",
+                       "autonomous.weather.no_alternate")
+            return
+        self._emit("info",
+                   f"Weather below limits at the destination: diverting "
+                   f"to {dest.ident}", "autonomous.weather.divert")
+        if self.crew.transmit:
+            try:
+                self.crew.transmit(
+                    f"diverting to {dest.ident}, weather below minima")
+            except Exception:
+                pass
+        self.session.destination = dest
+        self.state.weather_gas = 0
+        self._route_diversion()
         code = (self.state.aircraft_type or "").upper()
         return code[:1] in ("A", "B", "C", "D", "E", "F", "G", "H", "L") \
             and code not in ("C152", "C172", "C182", "C208", "C25A", "PA28",

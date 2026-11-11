@@ -472,6 +472,20 @@ class SimConnectSource:
         ("AMBIENT_TEMPERATURE", "ambient_temperature_c", "raw", "slow"),    # Celsius
         ("AMBIENT_VISIBILITY", "ambient_visibility_m", "raw", "slow"),      # Meters
         ("SEA_LEVEL_PRESSURE", "sea_level_pressure_hpa", "raw", "slow"),    # Millibars
+        # What the airframe is in: cloud and precipitation flags, the ice
+        # it has accreted, and TAT -- the figure icing decisions are made
+        # on, since it is warmer than ambient at speed.
+        ("AMBIENT_IN_CLOUD", "ambient_in_cloud", "bool", "slow"),
+        ("AMBIENT_PRECIP_STATE", "ambient_precip_state", "int", "slow"),
+        ("STRUCTURAL_ICE_PCT", "structural_ice_pct", "pct", "slow"),
+        ("TOTAL_AIR_TEMPERATURE", "total_air_temperature_c", "raw", "slow"),
+        # The wind in the aeroplane's axes, knots: the only per-second
+        # gust, crosswind and downdraft evidence there is to read.
+        ("AIRCRAFT_WIND_X", "aircraft_wind_x_kt", "raw", "slow"),
+        ("AIRCRAFT_WIND_Y", "aircraft_wind_y_kt", "raw", "slow"),
+        ("AIRCRAFT_WIND_Z", "aircraft_wind_z_kt", "raw", "slow"),
+        # Meters on the wire, feet in the state.
+        ("PRESSURE_ALTITUDE", "pressure_altitude_ft", "m_ft", "slow"),
     )
 
     def __init__(self, poll_interval: float = 0.25, request_timeout_ms: int = 400,
@@ -859,6 +873,8 @@ class SimConnectSource:
             # The design-performance speeds are asked for in the
             # wrapper's native feet per second.
             return float(raw) * 1.94384449
+        if kind == "m_ft":
+            return float(raw) * 3.28084
         return float(raw)
 
     @staticmethod
