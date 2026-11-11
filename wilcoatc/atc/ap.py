@@ -108,10 +108,21 @@ class FlightDirector:
     # -- the master --------------------------------------------------------
 
     def autopilot(self, on: bool = True) -> bool:
-        return self.send(b"AP_MASTER", 1 if on else 0)
+        """The AP master switch, set explicitly rather than toggled.
+
+        ``AP_MASTER`` is a toggle: asking for "on" with the AP already
+        engaged would switch it off. ``AUTOPILOT_ON``/``AUTOPILOT_OFF``
+        are the explicit setters; the toggle stands as the last fallback
+        for a sim that never mapped them.
+        """
+        ok = self.send(b"AUTOPILOT_ON" if on else b"AUTOPILOT_OFF", 0)
+        return ok or self.send(b"AP_MASTER", 0)
 
     def flight_director(self, on: bool = True) -> bool:
-        return self.send(b"TOGGLE_FLIGHT_DIRECTOR", 0)
+        """The flight director, set rather than toggled where a variable
+        or explicit event exists; ``TOGGLE_FLIGHT_DIRECTOR`` last."""
+        ok = self.write("AUTOPILOT FLIGHT DIRECTOR ACTIVE", 1.0 if on else 0.0)
+        return ok or self.send(b"TOGGLE_FLIGHT_DIRECTOR", 0)
 
     def yaw_damper(self, on: bool = True) -> bool:
         return self.send(b"YAW_DAMPER_ON" if on else b"YAW_DAMPER_OFF", 0)
@@ -137,7 +148,12 @@ class FlightDirector:
         return ok
 
     def nav(self, on: bool = True) -> bool:
-        """NAV1 lateral guidance: the flight plan, legs and all."""
+        """NAV1 lateral guidance: the flight plan, legs and all. A NAV
+        hold with the receiver still following a VOR tracks the beacon,
+        not the route -- ``GPS DRIVES NAV1`` puts the flight plan on the
+        needle before the hold is asked to fly it."""
+        if on:
+            self.write("GPS DRIVES NAV1", 1.0)
         return self.send(b"AP_NAV1_HOLD_ON" if on else b"AP_NAV1_HOLD_OFF", 0)
 
     def nav_source(self, index: int = 1) -> bool:
@@ -187,11 +203,16 @@ class FlightDirector:
     # -- speed -------------------------------------------------------------
 
     def speed(self, knots: float) -> bool:
-        """Indicated airspeed bug. ``AP_SPD_VAR_SET``'s parameter is the
-        speed in hundredths of a knot, so 140 kt is 14000 -- sending the
-        bare number commands one-point-four knots, which is what the old
-        code did."""
-        self.send(b"AP_SPD_VAR_SET", int(round(knots * 100.0)))
+        """Indicated airspeed bug.
+
+        The SDK documents ``AP_SPD_VAR_SET``'s value in whole knots and
+        ``AP_SPD_VAR_SET_EX1``'s in hundredths of a knot -- the EX1
+        variant keeps the decimal part the plain event would round
+        away. Both are tried, the precise one first, because a sim
+        without it should still get its 140 rather than 1.4.
+        """
+        self.send(b"AP_SPD_VAR_SET", int(round(knots)))
+        self.send(b"AP_SPD_VAR_SET_EX1", int(round(knots * 100.0)))
         return True
 
     def airspeed_hold(self, on: bool = True) -> bool:
@@ -211,34 +232,73 @@ class FlightDirector:
 
     # -- takeoff and go-around power ---------------------------------------
 
+    def autothrottle_arm(self) -> bool:
+        """Arm the autothrottle, once: ``AUTO_THROTTLE_ARM`` is a toggle,
+        so asking twice is asking to disarm."""
+        return self.once("autothrottle_armed", b"AUTO_THROTTLE_ARM", 0)
+
+    def autothrottle_disconnect(self) -> bool:
+        """Disconnect, explicitly: the disconnect event only ever
+        switches the autothrottle off."""
+        self.forget("autothrottle_armed")
+        return self.send(b"AUTO_THROTTLE_DISCONNECT", 0)
+
     def toga(self, on: bool = True) -> bool:
-        """Autothrottle takeoff/go-around mode where the model has one."""
-        return self.send(b"AUTO_THROTTLE_TO_GA", 0)
+        """Autothrottle takeoff/go-around mode where the model has one.
+
+        ``AUTO_THROTTLE_TO_GA`` cycles ranges on every press, so it is
+        pressed once per re-arm -- ``forget("toga")`` lets the next
+        go-around press it again.
+        """
+        if on:
+            return self.once("toga", b"AUTO_THROTTLE_TO_GA", 0)
+        self.forget("toga")
+        return True
 
     def go_around(self) -> bool:
         """The TO/GA press itself, where the model has the switch: the
         autopilot's go-around mode and the autothrottle's, together."""
-        return self.send(b"AUTO_THROTTLE_TO_GA", 0)
+        return self.toga(True)
 
     def throttle(self, position: float) -> bool:
-        """The thrust levers, 0..1 of travel: 0 idle, 1 takeoff. The
-        throttle lever variable first, the axis event after it, so a
-        model that takes the variable does not also get the event's
-        step."""
+        """The thrust levers, 0..1 of travel: 0 idle, 1 takeoff. Every
+        engine's lever variable first -- a twin whose second lever was
+        never written runs at whatever the pilot left it -- the shared
+        axis event after it, so a model that takes the variables does
+        not also get the event's step."""
         position = max(0.0, min(1.0, position))
-        if self.write("GENERAL ENG THROTTLE LEVER POSITION:1",
-                      position * 100.0):
+        ok = False
+        for engine in range(1, 5):
+            if self.write(f"GENERAL ENG THROTTLE LEVER POSITION:{engine}",
+                          position * 100.0):
+                ok = True
+        if ok:
             return True
-        return self.send(b"AXIS_THROTTLE_SET", int(round(position * AXIS_MAX)))
+        # ``AXIS_THROTTLE_SET`` puts the engine index in parameter [0],
+        # which a one-DWORD send cannot reach -- the value would land in
+        # the index slot. ``THROTTLE_SET``'s single value is the right
+        # shape here; the numbered axes cover a model that takes only
+        # per-engine commands.
+        value = int(round(position * 16383.0))
+        ok = self.send(b"THROTTLE_SET", value)
+        for engine in range(1, 5):
+            if self.send(f"AXIS_THROTTLE{engine}_SET".encode(), value):
+                ok = True
+        return ok
 
     def throttle_idle(self) -> bool:
         return self.throttle(0.0)
 
     def throttle_cut(self) -> bool:
-        return self.send(b"THROTTLE_CUT", 0)
+        ok = self.throttle(0.0)
+        self.send(b"THROTTLE_CUT", 0)
+        return ok
 
     def takeoff_power(self) -> bool:
-        return self.send(b"THROTTLE_FULL", 0)
+        """Full forward, once per re-arm: ``THROTTLE_FULL`` re-reads the
+        throttle ranges on every press on the models that honour it, and
+        a 4 Hz loop would keep re-flooring the levers."""
+        return self.once("takeoff_power", b"THROTTLE_FULL", 0)
 
     # -- flight controls, for the moments the AP cannot fly -----------------
 
@@ -255,6 +315,17 @@ class FlightDirector:
         are enabled, which is the pilot's own business then."""
         return self.send(b"AXIS_RUDDER_SET", _axis(position))
 
+    def steering(self, position: float) -> bool:
+        """The nosewheel, -1 full left .. +1 full right.
+
+        Rudder alone cannot turn a stopped aeroplane: on most singles
+        the nosewheel is steered by ``STEERING_SET`` (-16383..16383),
+        not by the rudder axis -- which is why taxi tracks wandered.
+        """
+        value = int(round(max(-1.0, min(1.0, position)) * 16383.0))
+        ok = self.send(b"STEERING_SET", value)
+        return self.send(b"AXIS_STEERING_SET", _axis(position)) or ok
+
     def center_controls(self) -> bool:
         ok = self.send(b"CENTER_AILER_RUDDER", 0)
         self.send(b"ELEVATOR_SET", 0)
@@ -263,18 +334,35 @@ class FlightDirector:
     # -- configuration ------------------------------------------------------
 
     def flaps(self, position: float) -> bool:
-        """Flap handle, 0 retracted .. 1 full, nearest detent."""
-        return self.send(b"AXIS_FLAPS_SET", int(round(position * AXIS_MAX)))
+        """Flap handle, 0 retracted .. 1 full, nearest detent.
+
+        ``FLAPS_SET`` takes 0..16383 up-to-down; the signed axis event
+        ``AXIS_FLAPS_SET`` (-16383 up .. +16383 down) is the fallback,
+        and the old code's unsigned value left the retracted end of it
+        sitting at mid-flap.
+        """
+        position = max(0.0, min(1.0, position))
+        ok = self.send(b"FLAPS_SET", int(round(position * 16383.0)))
+        if not ok:
+            ok = self.send(b"AXIS_FLAPS_SET",
+                           int(round(-16383.0 + position * 32766.0)))
+        return ok
 
     def gear(self, down: bool) -> bool:
         return self.send(b"GEAR_DOWN" if down else b"GEAR_UP", 0)
 
     def gear_set(self, position: float) -> bool:
-        return self.send(b"GEAR_SET", int(round(position * AXIS_MAX)))
+        """``GEAR_SET`` takes 0 up or 1 down, not an axis value: the old
+        ``position * 16384`` asked the gear for position 16384, which no
+        gear understands. Callers pass a fraction; the handle is binary.
+        """
+        return self.send(b"GEAR_SET", 1 if position >= 0.5 else 0)
 
     def spoilers(self, position: float) -> bool:
-        """Speedbrake handle, 0 up .. 1 down."""
-        return self.send(b"SPOILERS_SET", int(round(position * AXIS_MAX)))
+        """Speedbrake handle, 0 retracted .. 1 deployed
+        (``SPOILERS_SET``: 0..16383)."""
+        position = max(0.0, min(1.0, position))
+        return self.send(b"SPOILERS_SET", int(round(position * 16383.0)))
 
     def spoilers_arm(self, on: bool = True) -> bool:
         return self.send(b"SPOILERS_ARM_ON" if on else b"SPOILERS_ARM_OFF", 0)
@@ -284,13 +372,38 @@ class FlightDirector:
     def parking_brake(self, on: bool) -> bool:
         return self.send(b"PARKING_BRAKE_SET", 1 if on else 0)
 
+    def brakes(self, position: float) -> bool:
+        """The toe brakes, 0 released .. 1 held hard.
+
+        ``BRAKES_LEFT``/``BRAKES_RIGHT`` are step events -- they take no
+        value, so the old axis-style ``16384`` was noise and the brakes
+        stayed wherever they happened to be. The absolute positions go
+        through ``AXIS_LEFT_BRAKE_SET``/``AXIS_RIGHT_BRAKE_SET``
+        (-16383 released .. +16383 full), and where a model maps neither
+        the plain ``BRAKES`` event at least presses both together.
+        """
+        position = max(0.0, min(1.0, position))
+        value = int(round(-16383.0 + position * 32766.0))
+        left = self.send(b"AXIS_LEFT_BRAKE_SET", value)
+        right = self.send(b"AXIS_RIGHT_BRAKE_SET", value)
+        if not (left or right):
+            # No absolute brake axes: a hold can still be asked for by
+            # stepping, which is better than rolling through the stop.
+            for _ in range(0 if position < 0.5 else 6):
+                self.send(b"BRAKES", 0)
+        return left or right
+
     def pushback(self) -> bool:
         return self.send(b"TOGGLE_PUSHBACK", 0)
 
     # -- electrics and switches ------------------------------------------------
 
     def battery(self, on: bool = True) -> bool:
-        return self.send(b"BATTERY1_SET", 1 if on else 0)
+        """Every battery, the all-units setter first so a second bus
+        is not left dead where the model has one."""
+        ok = self.send(b"MASTER_BATTERY_SET", 1 if on else 0)
+        ok = self.send(b"BATTERY1_SET", 1 if on else 0) or ok
+        return ok
 
     def avionics(self, on: bool = True) -> bool:
         return self.send(b"AVIONICS_MASTER_SET", 1 if on else 0)
@@ -326,16 +439,22 @@ class FlightDirector:
         return False
 
     def kohlsman(self, hpa: float) -> bool:
-        """The altimeter setting. ``KOHLSMAN_SET``'s parameter is
-        hectopascals where the sim defines it that way; where it does
-        not the write simply fails and the pilot's own setting stands."""
-        return self.send(b"KOHLSMAN_SET", int(round(hpa)))
+        """The altimeter setting. ``KOHLSMAN_SET``'s value is millibars
+        times 16 -- 1013.25 hPa goes in as 16212 -- so a bare 1013 would
+        set 63 hPa, not "close enough"."""
+        return self.send(b"KOHLSMAN_SET", int(round(hpa * 16.0)))
 
-    def starter(self, on: bool = True) -> bool:
-        return self.send(b"STARTER1_SET", 1 if on else 0)
+    def starter(self, on: bool = True, engine: int = 1) -> bool:
+        return self.send(f"STARTER{engine}_SET".encode(), 1 if on else 0)
 
     def all_starters(self, on: bool = True) -> bool:
-        return self.send(b"TOGGLE_ALL_STARTERS", 0)
+        """``TOGGLE_ALL_STARTERS`` would flip running starters off as
+        readily as it turns stopped ones on, so the explicit ``SET``
+        forms go first and the toggle is only the last resort."""
+        ok = self.send(b"STARTER_SET", 1 if on else 0)
+        if not ok:
+            ok = self.send(b"TOGGLE_ALL_STARTERS", 0)
+        return ok
 
 
 __all__ = ["FlightDirector", "AXIS_MAX", "AXIS_MIN"]

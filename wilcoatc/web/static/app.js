@@ -417,6 +417,21 @@ function paintHeader() {
 
   const aircraft = state.aircraft || {};
   text($("ptt-key"), state.ptt_key || "`");
+
+  // The First Officer's pill: grey and quiet while off, breathing while
+  // it flies, red where the machine itself has called an error. The
+  // words say what the machine is doing, not just that it is doing it.
+  const fo = state.autonomous || {};
+  const foPill = $("fo-pill");
+  if (foPill) {
+    foPill.classList.toggle("is-on", Boolean(fo.enabled));
+    foPill.classList.toggle("is-error", Boolean(fo.error));
+    const phaseName = fo.phase ? t(`fo.phase.${fo.phase}`, fo.phase) : "";
+    text($("fo-text"), fo.error ? t("fo.error", "FO failed")
+      : fo.enabled ? `FO · ${phaseName || t("fo.on", "flying")}`
+      : t("fo.off", "FO off"));
+    foPill.title = fo.error || t("fo.title", "First Officer");
+  }
 }
 
 // --------------------------------------------------------------- comms ---
@@ -2638,6 +2653,23 @@ function wire() {
   on($("swap"), "click", async () => {
     const result = await post("/api/swap", { radio: 1 });
     if (!result.ok) toast(result.error || t("comms.no_swap", "could not swap"));
+  });
+
+  // The First Officer, engaged and let go from the header on every
+  // screen. The button asks for the opposite of what the last snapshot
+  // said, then shows what the engine answered -- not what was asked.
+  on($("fo-pill"), "click", async () => {
+    const now = (app.state && app.state.autonomous) || {};
+    const result = await post("/api/autonomous", { enabled: !now.enabled });
+    if (!result || !result.ok) {
+      toast((result && result.error)
+            || t("fo.failed", "Could not change the First Officer"));
+      return;
+    }
+    if (app.state && result.autonomous) {
+      app.state.autonomous = result.autonomous;
+      paintHeader();
+    }
   });
 
   // An AI departure lined up on the runway in use, for a pilot who wants

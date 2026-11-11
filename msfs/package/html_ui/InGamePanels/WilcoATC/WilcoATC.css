@@ -110,6 +110,32 @@
 .wa-link.is-nosim { background: var(--wa-wait-dim); border-color: rgba(245, 184, 65, 0.3); color: var(--wa-wait); }
 .wa-link.is-nosim .wa-link-dot { background: var(--wa-wait); }
 
+/* The First Officer's engage/stop, at the head's right edge. Quiet grey
+   while off, the found-green lit while it flies, and the alarm red where
+   the machine itself has stopped with an error. */
+.wa-fo {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--wa-edge-2);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: var(--wa-ink-55);
+  cursor: pointer;
+  user-select: none;
+}
+.wa-fo:hover { color: var(--wa-ink-85); border-color: rgba(255, 255, 255, 0.2); }
+.wa-fo-dot { width: 6px; height: 6px; margin-right: 6px; border-radius: 50%;
+  background: var(--wa-ink-50); }
+.wa-fo.is-on { background: var(--wa-found-dim); border-color: var(--wa-found-edge); color: var(--wa-found); }
+.wa-fo.is-on .wa-fo-dot { background: var(--wa-found); animation: wa-blink 2s infinite; }
+.wa-fo.is-error { background: rgba(242, 104, 92, 0.12); border-color: rgba(242, 104, 92, 0.4); color: #f2685c; }
+.wa-fo.is-error .wa-fo-dot { background: #f2685c; }
+
 /* ---------------------------------------------------------------- tabs --- */
 
 .wa-tabs { position: relative; display: flex; flex: 0 0 auto; padding: 8px 10px 0; }

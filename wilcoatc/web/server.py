@@ -1028,6 +1028,23 @@ def create_app(engine: Engine, broadcaster: Broadcaster) -> FastAPI:
         return {"ok": True, "letter": report.letter,
                 "text": as_written(report.text)}
 
+    @app.post("/api/autonomous")
+    async def autonomous(payload: dict) -> dict:
+        """Engage or stop the First Officer, live.
+
+        The button's on/off is not the settings screen's ``autonomous
+        flight`` default: that one says what happens at startup, this one
+        says what happens now. They do stay in step, so what the button
+        did last is what the switch shows.
+        """
+        enabled = bool((payload or {}).get("enabled"))
+        if enabled:
+            ok, why = engine.engage_autonomous()
+        else:
+            ok, why = engine.disengage_autonomous()
+        return {"ok": ok, "error": "" if ok else why,
+                "autonomous": engine.autonomous_status()}
+
     @app.post("/api/flight")
     async def flight(payload: dict) -> dict:
         """Set the details the simulator cannot supply."""
@@ -1243,6 +1260,13 @@ def _apply_settings(engine: Engine, payload: dict) -> set[str]:
     if "immersion.recordings_dir" in changed:
         engine.announcements.roots = announcement_roots(engine.config)
         engine.announcements.forget()
+    # The First Officer's switch works now, not on the next launch: the
+    # same paths the panel's engage/stop button takes.
+    if "immersion.autonomous_flight" in changed:
+        if engine.config.immersion.autonomous_flight:
+            engine.engage_autonomous()
+        else:
+            engine.disengage_autonomous()
 
     # Asking for the simulator is asking for it now, not on the next launch.
     if "sim.enabled" in changed:
@@ -2110,6 +2134,7 @@ def snapshot(engine: Engine) -> dict[str, Any]:
         "atis_letter": atis_letter,
         "transmitting": engine.microphone.recording,
         "playing": engine.player.busy,
+        "autonomous": engine.autonomous_status(),
         "ground": (engine.gsx.state.describe()
                    if getattr(engine, "gsx", None) is not None
                    and engine.gsx.state.available else ""),

@@ -53,6 +53,10 @@ COLLECTIVE_SET = b"AXIS_COLLECTIVE_SET"
 CYCLIC_LONG_SET = b"AXIS_CYCLIC_LONGITUDINAL_SET"
 CYCLIC_LAT_SET = b"AXIS_CYCLIC_LATERAL_SET"
 STEERING_SET = b"AXIS_STEERING_SET"
+# The pedals are anti-torque, not nosewheel: ``AXIS_TAIL_ROTOR_SET`` is
+# the helicopter's yaw channel; the steering axis only matters to the
+# models that ground-taxi on wheels and is sent alongside.
+TAIL_ROTOR_SET = b"AXIS_TAIL_ROTOR_SET"
 HELI_THROTTLE_SET = b"AXIS_HELICOPTER_THROTTLE_SET"
 # Named throttle events as fallbacks, per the same page: "set all
 # throttles", and the per-engine forms a twin might answer.
@@ -62,6 +66,7 @@ THROTTLE_ALL_CUT = b"HELICOPTER_THROTTLE_CUT"
 ROTOR_GOV_SET = b"ROTOR_GOV_SWITCH_SET"
 ROTOR_CLUTCH_SET = b"ROTOR_CLUTCH_SWITCH_SET"
 ROTOR_BRAKE = b"ROTOR_BRAKE"
+ROTOR_BRAKE_ON = b"ROTOR_BRAKE_ON"
 ENGINE_START = b"ENGINE_AUTO_START"
 ENGINE_STOP = b"ENGINE_AUTO_SHUTDOWN"
 
@@ -314,6 +319,21 @@ class RotorcraftFlight:
     def _elapsed(self) -> float:
         return time.monotonic() - self.state.stage_entered_at
 
+    def handoff(self) -> None:
+        """The owner's disengage: the controls to neutral.
+
+        Cyclic and pedals centre; the collective and throttle are left
+        where the last tick put them -- sending the collective to zero in
+        the air would be a command, not a release.
+        """
+        try:
+            self._send(CYCLIC_LONG_SET, 0)
+            self._send(CYCLIC_LAT_SET, 0)
+            self._send(TAIL_ROTOR_SET, 0)
+            self._send(STEERING_SET, 0)
+        except Exception:
+            log.debug("rotorcraft handoff raised", exc_info=True)
+
     # -- entry ------------------------------------------------------------
 
     def begin(self, session) -> None:
@@ -562,6 +582,7 @@ class RotorcraftFlight:
             self._collective(5.0)
             self._send(CYCLIC_LONG_SET, CYCLIC_TRIM_HOVER)
             self._send(CYCLIC_LAT_SET, 0)
+            self._send(TAIL_ROTOR_SET, 0)
             self._send(STEERING_SET, 0)
             self._send(b"PARKING_BRAKE_SET", 1)
             self._checklist("after_landing")
@@ -589,7 +610,10 @@ class RotorcraftFlight:
         if running and not self.state.rotor_brake_sent \
                 and getattr(state, "rotor_brake_available", False) \
                 and (rpm == 0.0 or rpm < ROTOR_BRAKE_BELOW_PCT):
-            self._send(ROTOR_BRAKE, 1)
+            # ROTOR_BRAKE is a stepper; the explicit ON goes first and the
+            # stepper is the fallback for a model that maps neither.
+            if not self._send(ROTOR_BRAKE_ON, 0):
+                self._send(ROTOR_BRAKE, 1)
             self.state.rotor_brake_sent = True
         cooled = elapsed >= SHUTDOWN_COOLDOWN_S or (rpm and rpm < 30.0)
         if running and cooled and not self.state.shutdown_sent:
@@ -674,9 +698,10 @@ class RotorcraftFlight:
         want_hdg = self._desired_track(state)
         if want_hdg:
             err = _heading_error(want_hdg, hdg)
-            self._send(STEERING_SET,
-                       int(_clamp(-PEDAL_DEG_PER_AXIS * err, -PEDAL_MAX,
-                                  PEDAL_MAX)))
+            pedal = int(_clamp(-PEDAL_DEG_PER_AXIS * err, -PEDAL_MAX,
+                               PEDAL_MAX))
+            self._send(TAIL_ROTOR_SET, pedal)
+            self._send(STEERING_SET, pedal)
 
         # -- throttle ---------------------------------------------------------
         if throttle is not None:

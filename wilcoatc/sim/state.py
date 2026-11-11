@@ -138,6 +138,9 @@ class AircraftState:
     # approach, so it can tell a needle that is alive from one that is not.
     nav1_freq: float = 0.0
     ap_airspeed_kt: float = 0.0
+    # AUTOTHROTTLE ACTIVE: whether the sim's own autothrottle is driving
+    # the levers -- the FO's throttle servo reads this before touching them.
+    autothrottle: bool = False
     # What the first officer notices (wilcoatc.atc.notices): engine 1's
     # throttle, per cent; the fuel either side, gallons; the total by
     # weight, pounds.

@@ -38,7 +38,7 @@ from ..config import Config
 from ..navdata.build import haversine_nm
 from ..navdata.db import Airport, NavDB
 from ..sim.source import SimConnectSource
-from . import approach_flight, auto_nav, vspeeds
+from . import approach_flight, auto_nav, procedure_legs, vspeeds
 from . import flying as fly
 from .ap import FlightDirector
 from .controller import ControllerBrain
@@ -163,6 +163,15 @@ class AutonomousState:
     nav_tune_at: float = 0.0
     circling: bool = False
     circle_path: list = field(default_factory=list)
+    # Filed/cleared SID and STAR guidance: the chosen transition's legs
+    # walked by ProcedureNavigator, keyed so a new clearance or field is
+    # a new navigator. ``procedure_suspended`` is the controller's
+    # "resume own navigation" for the active procedure.
+    sid_nav: object = None
+    star_nav: object = None
+    sid_key: tuple = ()
+    star_key: tuple = ()
+    procedure_suspended: str = ""
     # Landing: the flare's clock and the rollout's.
     flare_at: float = 0.0
     touchdown_at: float = 0.0
@@ -242,6 +251,10 @@ class AutonomousFlight:
         self._fuel_known = False
         self._ga_flag_seen = False
         self._last_state = None
+        # The throttle servo's last commanded lever position, 0..1.
+        self._last_lever = 0.0
+        # When the aeroplane last refused to move under taxi power.
+        self._ground_still_since = 0.0
 
         # Compute aircraft range for chain planning. The engine builds this
         # before a flight exists, so the session can be None.
@@ -360,22 +373,144 @@ class AutonomousFlight:
         self.config.immersion.autonomous_flight = True
 
     def disable(self) -> None:
+        """Stop the FO's hands, then hand the aeroplane back.
+
+        The flag goes first so no tick runs after the handoff has centred
+        the controls; a FO that lets go leaving the elevator deflected is
+        how a disengage becomes an upset.
+        """
         self._enabled = False
         self.config.immersion.autonomous_flight = False
+        self._handoff()
+
+    def engage(self, session: Optional[FlightSession] = None) -> bool:
+        """The panel's engage, live: start the machine fresh wherever the
+        aeroplane already is. False when there is no flight to fly yet --
+        the next ``begin_flight`` picks the flag up instead."""
+        self.enable()
+        session = session or self.session
+        if session is None:
+            return False
+        self.begin_flight(session)
+        return True
+
+    def disengage(self) -> None:
+        """The panel's stop: same as ``disable`` -- off, controls handed
+        back, config flag cleared so a restart does not fly itself."""
+        self.disable()
+
+    def _handoff(self) -> None:
+        """Leave the aeroplane controllable the instant the FO lets go:
+        surfaces centred, and every mode *this machine* engaged back off.
+
+        The surfaces centre unconditionally -- a deflected elevator left
+        from a flare is the worst souvenir there is. The AP and AT come
+        off only where the FO turned them on: an autopilot the pilot
+        engaged before the FO did is the pilot's, not this machine's to
+        switch.
+        """
+        heli = self._heli
+        if heli is not None and hasattr(heli, "handoff"):
+            try:
+                heli.handoff()
+            except Exception:
+                log.debug("rotorcraft handoff raised", exc_info=True)
+        d = self._dir
+        if d is None:
+            return
+        try:
+            d.elevator(0.0)
+            d.aileron(0.0)
+            d.rudder(0.0)
+            d.steering(0.0)
+            d.center_controls()
+            if self.state.ap_master:
+                d.autopilot(False)
+            if self.state.ap_apr_mode:
+                d.approach(False)
+                d.localizer(False)
+            if self.state.ap_vs_mode:
+                d.vs_hold(False)
+            if self.state.ap_alt_mode:
+                d.alt_hold(False)
+            if self.state.ap_speed_mode:
+                d.airspeed_hold(False)
+                d.autothrottle_disconnect()
+            if self._ap_mode == "managed" and self.state.ap_master:
+                d.level_change(False)
+            state = self._last_state
+            if state is None or getattr(state, "on_ground", True):
+                d.throttle(0.0)
+                d.throttle_idle()
+                d.brakes(0.0)
+            d.reset()
+        except Exception:
+            log.debug("autonomous handoff raised", exc_info=True)
+        self._last_lever = 0.0
+        self.state.ap_master = False
+        self.state.ap_hdg_mode = False
+        self.state.ap_nav_mode = False
+        self.state.ap_alt_mode = False
+        self.state.ap_vs_mode = False
+        self.state.ap_speed_mode = False
+        self.state.ap_apr_mode = False
+
+    def status(self) -> dict:
+        """What the panel shows about the FO: on or off, and if on, what
+        the machine is doing."""
+        return {
+            "available": self.sim is not None,
+            "enabled": self._enabled,
+            "helicopter": self._is_helicopter,
+            "phase": self.state.phase.value,
+            "sub": self.state.sub or "",
+            "error": (self.state.error_message
+                      if self.state.phase == AutonomousPhase.ERROR else ""),
+        }
+
+    def _entry_phase(self, session: FlightSession):
+        """Where an engage joins the flight, by where the aeroplane is.
+
+        A ground start walks the whole machine from preflight; an engage
+        in the air must not -- a FO asked to take over on climbout who
+        began by running the before-start checklist would fly the
+        aeroplane into whatever was in front of it.
+        """
+        try:
+            state = self.get_state()
+        except Exception:
+            state = None
+        if state is None or not getattr(state, "connected", False) \
+                or getattr(state, "on_ground", True):
+            return AutonomousPhase.PREFLIGHT, "systems"
+        session_phase = getattr(session, "phase", Phase.PREFLIGHT)
+        if session_phase in (Phase.APPROACH, Phase.LANDING):
+            return AutonomousPhase.APPROACH, "intercept"
+        if session_phase == Phase.DESCENT:
+            return AutonomousPhase.DESCENT, ""
+        target = self._altitude_target(state)
+        altitude = float(getattr(state, "altitude_ft", 0.0) or 0.0)
+        if target and altitude > target + 500.0:
+            return AutonomousPhase.DESCENT, ""
+        if target and abs(altitude - target) <= 500.0:
+            return AutonomousPhase.CRUISE, ""
+        return AutonomousPhase.CLIMB, ""
 
     def begin_flight(self, session: FlightSession) -> None:
         """Start a new autonomous flight."""
         self.session = session
         self.state = AutonomousState()
-        self.state.phase = AutonomousPhase.PREFLIGHT
+        self.state.phase, sub = self._entry_phase(session)
         self.state.phase_entered_at = time.monotonic()
-        self._goto_sub("systems")
+        self._goto_sub(sub)
         if self._dir is not None:
             self._dir.reset()
         self._perf = None
         self._speeds = None
         self._fuel_known = False
         self._heli = None
+        self._last_lever = 0.0
+        self._ground_still_since = 0.0
         # Compute aircraft performance for chain planning
         self._compute_aircraft_performance(session)
         self._is_helicopter = self._detect_helicopter(session)
@@ -391,7 +526,11 @@ class AutonomousFlight:
             self._emit("info", "Simulator AI assist is not available; "
                        "flying with the First Officer's own autopilot",
                        "autonomous.sim_ai.unused")
-        self._emit("info", "Autonomous flight started", "autonomous.started")
+        # The engine calls this for every new session, engaged or not --
+        # only the engaged machine gets to announce itself.
+        if self._enabled:
+            self._emit("info", "Autonomous flight started",
+                       "autonomous.started")
 
     def set_chain_flights(self, flights: list[dict]) -> None:
         """Set up chained flights from a list of flight plans."""
@@ -437,8 +576,10 @@ class AutonomousFlight:
 
         # Pushback progress, which the phase reads: a push that has moved the
         # aeroplane and then stopped is done, however the tug was attached.
+        # The threshold is under a knot: a tug walks the aeroplane, and two
+        # knots is faster than the push ever gets.
         if self.state.phase == AutonomousPhase.PUSHBACK:
-            if (state.ground_speed_kt or 0.0) > 2.0:
+            if (state.ground_speed_kt or 0.0) > 0.8:
                 self.state.moved_since_push = True
                 self.state.still_since = now
             elif self.state.moved_since_push and self.state.still_since == 0.0:
@@ -532,9 +673,14 @@ class AutonomousFlight:
         rate is wanted (climb or descent in progress); zero means level.
         """
         d = self.director
-        if not self.state.ap_master:
+        # The sim's own flag is the truth: a pilot who bumped the AP off
+        # mid-engage gets it back rather than a machine that "remembers"
+        # engaging it once and never asks again. AUTOPILOT_ON is
+        # idempotent, so a model that never reports the variable just
+        # gets asked every pass.
+        if not getattr(state, "autopilot", False):
             d.autopilot(True)
-            self.state.ap_master = True
+        self.state.ap_master = True
         if altitude:
             d.altitude(altitude)
         if heading >= 0.0:
@@ -543,6 +689,7 @@ class AutonomousFlight:
         if speed_kt:
             d.speed(speed_kt)
             self.state.ap_speed_mode = True
+            self._manage_throttle(state, speed_kt)
         if vs_fpm:
             d.vertical_speed(vs_fpm)
             d.vs_hold(True)
@@ -564,6 +711,57 @@ class AutonomousFlight:
                     and abs(vs_fpm) < 1:
                 d.level_change(False)
 
+    def _manage_throttle(self, state, target_kt: float) -> None:
+        """The FO's own throttle, for the aeroplanes with no autothrottle.
+
+        On a model whose autopilot cannot hold speed the lever stays
+        where takeoff or the go-around left it -- full power all the way
+        to the red line. This servo moves the levers only when the speed
+        is genuinely off target, so a working autothrottle, which keeps
+        the speed inside the deadband on its own, is never fought.
+        """
+        if not target_kt or state.on_ground or not state.engines_running:
+            return
+        # A live autothrottle owns the levers: the servo's job only exists
+        # where there is none, and two hands on one lever is a porpoise.
+        if getattr(state, "autothrottle", False):
+            return
+        if self.state.phase == AutonomousPhase.APPROACH:
+            # The go-around owns the levers, and the pattern right after
+            # it is still a climb to the missed altitude, not an arrival
+            # at approach speed.
+            if self.state.sub == "go_around":
+                return
+            missed = self.state.missed_alt_ft or 0.0
+            if missed and (state.altitude_ft or 0.0) < missed \
+                    and time.monotonic() - self.state.go_around_at < 180.0:
+                return
+        ias = float(getattr(state, "indicated_airspeed_kt", 0.0) or 0.0)
+        if ias <= 20.0:
+            return
+        lever = self._lever_position(state)
+        barber = float(getattr(state, "barber_pole_kt", 0.0) or 0.0)
+        err = ias - target_kt
+        if barber > 0.0 and ias >= barber * 0.97:
+            # At the red line the lever comes down, whatever the target.
+            lever = min(lever - 0.10, 0.40)
+        elif err > 8.0:
+            lever -= min(0.20, 0.02 + err * 0.006)
+        elif err < -15.0:
+            lever += min(0.15, 0.02 + (-err) * 0.006)
+        else:
+            return
+        lever = max(0.05, min(0.97, lever))
+        self._last_lever = lever
+        self.director.throttle(lever)
+
+    def _lever_position(self, state) -> float:
+        """Where the levers are, 0..1, as the sim last reported them."""
+        pct = float(getattr(state, "throttle_pct", 0.0) or 0.0)
+        if pct > 0.0:
+            return max(0.0, min(1.0, pct / 100.0))
+        return self._last_lever
+
     def _run_checklist_for_phase(self, checklist_name: str) -> None:
         """Trigger a checklist for the current phase."""
         if checklist_name not in self.state.checklists_completed:
@@ -580,11 +778,33 @@ class AutonomousFlight:
 
     def _set_takeoff_power(self) -> None:
         """Takeoff thrust: full, and TO/GA on the autothrottle where the
-        model has one."""
+        model has one. The one-shot events re-arm on each roll and each
+        go-around; the lever position itself is re-asked every call."""
         d = self.director
         d.takeoff_power()
         d.throttle(1.0)
+        self._last_lever = 1.0
         d.toga(True)
+
+    def _ground_still(self, state, now: float) -> bool:
+        """Whether the aeroplane has refused to move under power for a
+        while -- chocked, braked, or boxed in. Taxi power against a
+        stationary aeroplane is how the engine ends up at takeoff rpm on
+        the ramp, so after a dozen seconds of it the levers come back to
+        idle and the phase decides what to do about not moving."""
+        if (state.ground_speed_kt or 0.0) > 1.0:
+            self._ground_still_since = 0.0
+            return False
+        if self._ground_still_since == 0.0:
+            self._ground_still_since = now
+            return False
+        stuck = now - self._ground_still_since
+        if stuck <= 12.0:
+            return False
+        # Idle while it refuses to move, but probe with power for a few
+        # seconds of every half minute: a chock coming out or a brake
+        # releasing should not need a whole new flight to notice.
+        return not 27.0 <= stuck % 30.0 < 30.0
 
     def _steer(self, state, desired_hdg: float, target_kt: float,
                max_aileron: float = 0.35) -> None:
@@ -606,10 +826,16 @@ class AutonomousFlight:
             else 28.0
         rudder = max(-0.5, min(0.5, err / divisor))
         d.rudder(rudder)
+        # The nosewheel follows the same demand where the model steers it
+        # separately: a taildragger on rudder alone and a tricycle gear on
+        # STEERING_SET both get their turn.
+        d.steering(rudder)
         # Taxi and rollout speeds are throttle jobs, not AP jobs -- and
         # progressive ones: the further below target, the more asked for.
         gs = state.ground_speed_kt or 0.0
-        if gs < target_kt - 2.0:
+        if self._ground_still(state, time.monotonic()):
+            d.throttle(0.0)
+        elif gs < target_kt - 2.0:
             d.throttle(max(0.05, min(0.6,
                                      0.10 + (target_kt - gs) * 0.01)))
         elif gs > target_kt + 4.0 and state.on_ground:
@@ -624,6 +850,7 @@ class AutonomousFlight:
         if gs <= 1.0:
             d.parking_brake(True)
             d.rudder(0.0)
+            d.steering(0.0)
             d.center_controls()
 
     # -- the phase machine ----------------------------------------------------
@@ -719,13 +946,16 @@ class AutonomousFlight:
                 self._transition(AutonomousPhase.TAXI_OUT)
                 return
             if not self.state.moved_since_push:
-                # The tug never moved it: ask again, a few times, then
-                # give up rather than taxi out attached to nothing.
-                if self._sub_age() > 60.0 and self.state.push_retries < 3:
+                # The tug never moved it: ask again, but not often. The
+                # simulator's pushback is a toggle -- a second call while
+                # the first is still walking the aeroplane cancels it --
+                # so a retry waits well past the time a push takes, and
+                # there are only two of them before it is an error.
+                if self._sub_age() > 120.0 and self.state.push_retries < 2:
                     self._request_pushback()
                     self.state.push_retries += 1
                     self.state.sub_entered_at = now
-                if self.state.push_retries >= 3 and self._sub_age() > 60.0:
+                if self.state.push_retries >= 2 and self._sub_age() > 120.0:
                     self._set_error("Pushback did not move the aircraft")
                     return
             if now - self.state.phase_entered_at > self.PUSHBACK_TIMEOUT:
@@ -835,6 +1065,9 @@ class AutonomousFlight:
             self._stop(state)
             if self.session.cleared_takeoff:
                 self.state.rejected = False
+                # The power events are one-shot: a new roll is a new
+                # press of TO/GA and THROTTLE_FULL.
+                self.director.forget("takeoff_power", "toga")
                 self._goto_sub("roll")
             elif self._sub_age() > 300.0:
                 self._set_error("Takeoff clearance never came")
@@ -862,13 +1095,15 @@ class AutonomousFlight:
                 self._goto_sub("abort")
                 return
             self._set_takeoff_power()
-            # Directional control with the rudder into the runway heading.
+            # Directional control: the nosewheel does the early work, the
+            # rudder takes over as the airflow comes alive. Both get the
+            # same demand; a model that only honours one still tracks.
             err = ((self.state.runway_heading - (state.heading_true or 0.0)
                     + 540.0) % 360.0 - 180.0)
-            if abs(err) < 2.0:
-                d.rudder(0.0)
-            else:
-                d.rudder(max(-0.6, min(0.6, err / 10.0)))
+            keep = 0.0 if abs(err) < 2.0 else max(-0.6, min(0.6, err / 10.0))
+            d.rudder(keep)
+            d.steering(keep if (state.indicated_airspeed_kt or 0.0) < 60.0
+                       else 0.0)
             rotate_at = (self.state.vr_kt
                          or self.state.min_rotation_kt
                          or self.performance.rotate_kt)
@@ -941,7 +1176,12 @@ class AutonomousFlight:
         """Climb to the assigned or planned level."""
         target = self._altitude_target(state)
         assigned_hdg = self.session.assigned_heading or 0.0
-        if assigned_hdg:
+        sid = self._sid_nav(state)
+        if sid is not None:
+            # A filed/cleared SID owns the lateral path until its last
+            # leg; the assigned heading still wins where ATC gave one.
+            self._fly_procedure(state, sid)
+        elif assigned_hdg:
             self._apply_flight_director(state, altitude=target,
                                         vs_fpm=self.performance.climb_fpm,
                                         heading=assigned_hdg,
@@ -971,12 +1211,17 @@ class AutonomousFlight:
     def _phase_cruise(self, state, now: float) -> None:
         """Cruise: NAV on the route, fuel watched, clearances followed."""
         self._run_checklist_for_phase("cruise")
-        self.director.nav(True)
-        self.director.airspeed_hold(True)
-        target = self._altitude_target(state)
-        self.director.altitude(target)
-        self.director.alt_hold(True)
-        self.director.speed(self._speed_target(state))
+        sid = self._sid_nav(state)
+        if sid is not None:
+            self._fly_procedure(state, sid)
+        else:
+            self.director.nav(True)
+            self.director.airspeed_hold(True)
+            target = self._altitude_target(state)
+            self.director.altitude(target)
+            self.director.alt_hold(True)
+            self._manage_throttle(state, self._speed_target(state))
+            self.director.speed(self._speed_target(state))
 
         if self.session.phase == Phase.DESCENT:
             self._transition(AutonomousPhase.DESCENT)
@@ -1022,14 +1267,17 @@ class AutonomousFlight:
                                 or 0.0))
         if not 100.0 <= descent_fpm <= 6000.0:
             descent_fpm = self.performance.descend_fpm
-        # A heading ATC has given -- a vector, the intercept -- is flown
-        # here as it is on the climb; without one the route's own guidance
-        # (NAV in managed mode, wings level otherwise) stands.
-        assigned_hdg = self.session.assigned_heading or 0.0
-        self._apply_flight_director(state, altitude=target,
-                                    vs_fpm=-descent_fpm,
-                                    heading=assigned_hdg or -1.0,
-                                    speed_kt=speed)
+        # A filed/cleared STAR owns the lateral path until its last leg;
+        # an assigned heading still wins where ATC gave one.
+        star = self._star_nav(state)
+        if star is not None:
+            self._fly_procedure(state, star)
+        else:
+            assigned_hdg = self.session.assigned_heading or 0.0
+            self._apply_flight_director(state, altitude=target,
+                                        vs_fpm=-descent_fpm,
+                                        heading=assigned_hdg or -1.0,
+                                        speed_kt=speed)
 
         # The approach's own navaid, tuned early enough that the needles
         # are alive by the time the final is flown.
@@ -1138,6 +1386,7 @@ class AutonomousFlight:
                     self.state.ap_master = False
                 d.throttle_idle()
                 d.throttle(0.0)
+                self._last_lever = 0.0
                 d.elevator(0.15)  # a touch of back pressure to arrest the sink
                 # Still aligned with the runway.
                 if self.state.runway_heading > 0:
@@ -1152,6 +1401,7 @@ class AutonomousFlight:
             else:
                 # On the glide: idle-ish, configured, on speed.
                 d.throttle(0.05)
+                self._last_lever = 0.05
                 d.approach(True)
                 if self.state.runway_heading <= 0:
                     self._find_runway(state)
@@ -1161,21 +1411,38 @@ class AutonomousFlight:
 
         if sub == "rollout":
             # Down: spoilers if armed, brakes on, steer to the exit or the
-            # taxi path, slow to taxi speed.
+            # taxi path, slow to taxi speed. The aeroplane is on the
+            # ground now -- the flight is over, and an autopilot left in
+            # speed hold on the ground is what runs the levers to the
+            # stops while parked.
+            if self.state.ap_master or self.state.ap_speed_mode \
+                    or self.state.ap_apr_mode or self.state.ap_vs_mode:
+                d.autopilot(False)
+                d.airspeed_hold(False)
+                d.approach(False)
+                d.localizer(False)
+                d.vs_hold(False)
+                if self._ap_mode == "managed":
+                    d.level_change(False)
+                self.state.ap_master = False
+                self.state.ap_speed_mode = False
+                self.state.ap_apr_mode = False
+                self.state.ap_vs_mode = False
+                self.state.ap_alt_mode = False
+                self.state.ap_hdg_mode = False
+                self.state.ap_nav_mode = False
             d.spoilers(1.0)
             d.spoilers_arm(True)
             d.flaps(0.0)
             gs = state.ground_speed_kt or 0.0
             if gs > self.performance.taxi_kt + 5.0:
                 # Speedbrakes are already out; the wheel brakes take it
-                # from here, at the axis scale the BRAKES events read.
+                # from here, at the axis scale the brake axes read.
                 d.parking_brake(False)
-                d.send(b"BRAKES_LEFT", 16384)
-                d.send(b"BRAKES_RIGHT", 16384)
+                d.brakes(1.0)
             else:
                 # Slow enough: brakes off, taxi in.
-                d.send(b"BRAKES_LEFT", 0)
-                d.send(b"BRAKES_RIGHT", 0)
+                d.brakes(0.0)
                 if not self.state.vacated:
                     self.state.vacated = True
                     self._run_checklist_for_phase("after_landing")
@@ -1187,7 +1454,9 @@ class AutonomousFlight:
                 err = ((self.state.runway_heading
                         - (state.heading_true or 0.0) + 540.0)
                        % 360.0 - 180.0)
-                d.rudder(max(-0.4, min(0.4, err / 15.0)))
+                rudder = max(-0.4, min(0.4, err / 15.0))
+                d.rudder(rudder)
+                d.steering(rudder)
             return
 
     def _phase_taxi_in(self, state, now: float) -> None:
@@ -1227,7 +1496,16 @@ class AutonomousFlight:
 
         if sub == "secure":
             # The walk-around items the FO does: lights off except the
-            # beacon, pitot heat off, controls centred.
+            # beacon, pitot heat off, controls centred. The autopilot
+            # comes off too -- a parked aeroplane has no flight director.
+            d.autopilot(False)
+            d.airspeed_hold(False)
+            d.approach(False)
+            d.vs_hold(False)
+            self.state.ap_master = False
+            self.state.ap_speed_mode = False
+            self.state.ap_apr_mode = False
+            self.state.ap_vs_mode = False
             d.strobes(False)
             d.landing_light(False)
             d.taxi_light(False)
@@ -1323,9 +1601,12 @@ class AutonomousFlight:
             d.parking_brake(False)
             err = ((steer["heading"] - (state.heading_true or 0.0)
                     + 540.0) % 360.0 - 180.0)
-            d.rudder(max(-0.5, min(0.5, err / 25.0)))
+            turn = max(-0.5, min(0.5, err / 25.0))
+            d.rudder(turn)
+            d.steering(turn)
             gs = state.ground_speed_kt or 0.0
-            if target_kt <= 0.0:
+            if target_kt <= 0.0 or self._ground_still(
+                    state, time.monotonic()):
                 self._stop(state)
             elif gs < target_kt - 1.5:
                 d.throttle(0.15)
@@ -1378,6 +1659,183 @@ class AutonomousFlight:
                 # Slow with nowhere to go: stop and wait for the taxi
                 # instruction rather than roll the runway's length.
                 self._stop(state)
+
+    # -- filed/cleared SID/STAR guidance -----------------------------------
+
+    def _route_idents(self) -> tuple:
+        route = getattr(self.brain, "route", None)
+        if route is None:
+            return ()
+        return tuple(getattr(fix, "ident", "") or ""
+                     for fix in getattr(route, "fixes", ()) or ())
+
+    def _airport_ident(self, airport, fallback: str = "") -> str:
+        if airport is not None:
+            ident = getattr(airport, "ident", "") or ""
+            if ident:
+                return ident
+        return fallback
+
+    def _runway_start(self, ident: str, runway: str,
+                      procedures) -> tuple:
+        """Where the SID's first leg begins: the runway end where the
+        navdata knows it, the airport reference where it does not."""
+        found = auto_nav.runway_end(self.navdb.runways(ident), runway)
+        if found is not None:
+            return found[0], found[1]
+        return (getattr(procedures, "lat", 0.0) or 0.0,
+                getattr(procedures, "lon", 0.0) or 0.0)
+
+    def _sid_nav(self, state):
+        """The filed/cleared departure procedure's guidance, if any.
+
+        Only a SID the route or the clearance actually names is flown --
+        an arbitrary procedure is never invented. The transition is the
+        one matching the assigned or planned runway, else the only one
+        the procedure has.
+        """
+        if self.state.procedure_suspended == "sid":
+            return None
+        if getattr(self.session, "assigned_heading", None):
+            # A vector is off the procedure until ATC says resume own
+            # navigation; the heading bug is the clearance, not the leg.
+            return None
+        route = getattr(self.brain, "route", None)
+        ident = self._airport_ident(
+            getattr(self.session, "departure", None),
+            getattr(route, "origin", "") or "")
+        if not ident:
+            return None
+        procs = getattr(self.brain, "terminal_procedures", {}).get(ident)
+        if not procs:
+            return None
+        name = (getattr(self.session, "sid", "")
+                or (getattr(route, "sid", "") if route else "") or "")
+        if not name:
+            return None
+        runway = (getattr(self.session, "departure_runway", "")
+                  or self.state.departure_runway
+                  or (getattr(route, "sid_runway", "") if route else "")
+                  or "")
+        transition = (getattr(route, "sid_transition", "")
+                      if route else "") or ""
+        proc, trans = procedure_legs.choose_sid(
+            procs, name, runway, transition, self._route_idents())
+        if trans is None:
+            return None
+        key = (ident, proc.name, trans.name, trans.runway, runway)
+        if self.state.sid_key != key or self.state.sid_nav is None:
+            start = self._runway_start(ident, runway or trans.runway, procs)
+            self.state.sid_nav = procedure_legs.ProcedureNavigator(
+                proc, trans, start,
+                fallback_altitude_ft=self._altitude_target(state),
+                fallback_speed_kt=self._speed_target(state))
+            self.state.sid_key = key
+            self._emit("info", f"Flying SID {proc.name} "
+                       f"{trans.name or trans.runway}".strip(),
+                       "autonomous.sid")
+        nav = self.state.sid_nav
+        nav.fallback_altitude_ft = self._altitude_target(state)
+        nav.fallback_speed_kt = self._speed_target(state)
+        guidance = nav.guidance(
+            state, climb_fpm=self.performance.climb_fpm,
+            descend_fpm=self.performance.descend_fpm)
+        if guidance.done:
+            self.state.sid_nav = None
+            self.state.sid_key = ()
+            return None
+        return guidance
+
+    def _star_nav(self, state):
+        """The filed/cleared arrival procedure's guidance, if any."""
+        if self.state.procedure_suspended == "star":
+            return None
+        if getattr(self.session, "assigned_heading", None):
+            return None
+        route = getattr(self.brain, "route", None)
+        ident = self._airport_ident(
+            getattr(self.session, "destination", None),
+            getattr(route, "destination", "") or "")
+        if not ident:
+            return None
+        procs = getattr(self.brain, "terminal_procedures", {}).get(ident)
+        if not procs:
+            return None
+        name = (getattr(self.session, "descend_via", "")
+                or (getattr(route, "star", "") if route else "") or "")
+        if not name:
+            return None
+        runway = (getattr(self.session, "arrival_runway", "")
+                  or self.state.arrival_runway
+                  or (getattr(route, "star_runway", "") if route else "")
+                  or "")
+        transition = (getattr(route, "star_transition", "")
+                      if route else "") or ""
+        proc, trans = procedure_legs.choose_star(
+            procs, name, runway, transition, self._route_idents())
+        if trans is None:
+            return None
+        key = (ident, proc.name, trans.name, trans.runway, runway)
+        if self.state.star_key != key or self.state.star_nav is None:
+            self.state.star_nav = procedure_legs.ProcedureNavigator(
+                proc, trans,
+                (state.latitude, state.longitude),
+                fallback_altitude_ft=(
+                    getattr(self.session, "assigned_altitude_ft", 0.0)
+                    or self._descent_floor(state)),
+                fallback_speed_kt=(
+                    getattr(self.session, "assigned_speed_kt", 0.0)
+                    or (self.state.vapp_kt
+                        or self.performance.approach_kt) + 20.0))
+            self.state.star_key = key
+            self._emit("info", f"Descending via STAR {proc.name} "
+                       f"{trans.name or trans.runway}".strip(),
+                       "autonomous.star")
+        nav = self.state.star_nav
+        nav.fallback_altitude_ft = (
+            getattr(self.session, "assigned_altitude_ft", 0.0)
+            or self._descent_floor(state))
+        nav.fallback_speed_kt = (
+            getattr(self.session, "assigned_speed_kt", 0.0)
+            or (self.state.vapp_kt
+                or self.performance.approach_kt) + 20.0)
+        guidance = nav.guidance(
+            state, climb_fpm=self.performance.climb_fpm,
+            descend_fpm=self.performance.descend_fpm)
+        if guidance.done:
+            self.state.star_nav = None
+            self.state.star_key = ()
+            return None
+        return guidance
+
+    def _fly_procedure(self, state, guidance) -> None:
+        """Put a procedure leg's targets on the autopilot.
+
+        An assigned heading, level or speed still outranks the
+        procedure's own targets -- ATC's word is the clearance.
+        """
+        assigned_hdg = self.session.assigned_heading or 0.0
+        heading = assigned_hdg or (
+            self._magnetic(guidance.heading, state)
+            if guidance.heading is not None else -1.0)
+        assigned_alt = self.session.assigned_altitude_ft or 0.0
+        altitude = assigned_alt or guidance.altitude_ft \
+            or self._altitude_target(state)
+        if assigned_alt:
+            current = state.altitude_ft or 0.0
+            if current < assigned_alt - 250.0:
+                vs = self.performance.climb_fpm
+            elif current > assigned_alt + 250.0:
+                vs = -self.performance.descend_fpm
+            else:
+                vs = 0.0
+        else:
+            vs = guidance.vs_fpm
+        speed = (self.session.assigned_speed_kt
+                 or guidance.speed_kt or self._speed_target(state))
+        self._apply_flight_director(
+            state, altitude=altitude, vs_fpm=vs,
+            heading=heading, speed_kt=speed)
 
     # -- the approach's own pieces --------------------------------------------
 
@@ -1800,9 +2258,13 @@ class AutonomousFlight:
             self._transition(AutonomousPhase.APPROACH)
         self._goto_sub("go_around")
         d = self.director
+        # A fresh TO/GA press: the same one-shot events the takeoff roll
+        # fired have to be allowed to fire again.
+        d.forget("takeoff_power", "toga")
         d.go_around()
         d.takeoff_power()
         d.throttle(1.0)
+        self._last_lever = 1.0
         d.elevator(0.3)   # the pitch-up
         d.gear(False)
         # Flaps one stage up, not all the way: the go-around flap setting.
@@ -1823,9 +2285,11 @@ class AutonomousFlight:
         if elapsed < 8.0:
             d.elevator(0.25)
             d.throttle(1.0)
+            self._last_lever = 1.0
         else:
             d.elevator(0.05)
             d.throttle(0.7)
+            self._last_lever = 0.7
             if state.flaps_index:
                 d.flaps(0.0)
             if state.gear_down:
@@ -1923,6 +2387,14 @@ class AutonomousFlight:
         if dest is not None:
             self.session.destination = dest
             self.session.ifr = False  # an emergency is flown, not filed
+            self.session.sid = ""
+            self.session.descend_via = ""
+            self.session.star_join = ""
+            self.state.sid_nav = None
+            self.state.star_nav = None
+            self.state.sid_key = ()
+            self.state.star_key = ()
+            self.state.procedure_suspended = ""
             if self.use_route is not None:
                 try:
                     from .route import from_string, resolver
@@ -2128,6 +2600,9 @@ class AutonomousFlight:
         self.session.cleared_takeoff = False
         self.session.cleared_landing = False
         self.session.lined_up = False
+        self.session.sid = ""
+        self.session.descend_via = ""
+        self.session.star_join = ""
         self.session.departure_runway = ""
         self.session.arrival_runway = ""
         self.session.hold_short_of = ""
@@ -2176,7 +2651,14 @@ class AutonomousFlight:
         self.state.nav_tune_at = 0.0
         self.state.circling = False
         self.state.circle_path = []
+        self.state.sid_nav = None
+        self.state.star_nav = None
+        self.state.sid_key = ()
+        self.state.star_key = ()
+        self.state.procedure_suspended = ""
         self._ga_flag_seen = False
+        self._last_lever = 0.0
+        self._ground_still_since = 0.0
         if self._dir is not None:
             self._dir.reset()
         self._speeds = None
@@ -2344,8 +2826,15 @@ class AutonomousFlight:
                 self.state.ap_nav_mode = True
             d.speed(speed)
             d.airspeed_hold(True)
+            # Speed hold only drives the levers where an autothrottle is
+            # armed -- aircraft.cfg's autothrottle_arming_required makes
+            # the arm a separate ask, sent once and only while the sim
+            # says the AT is not already live.
+            if not getattr(state, "autothrottle", False):
+                d.autothrottle_arm()
             d.altitude(target)
             d.level_change(True)
+            self._manage_throttle(state, speed)
         else:
             self._apply_flight_director(state, altitude=target,
                                         vs_fpm=self.performance.climb_fpm,
@@ -2390,14 +2879,18 @@ def create_autonomous_flight(
     get_state: Callable[[], object],
     on_event: Callable[[str, str, str], None],
     use_route: Optional[Callable[[object], None]] = None,
-) -> Optional[AutonomousFlight]:
-    """Factory function to create AutonomousFlight if enabled."""
-    if config.immersion.autonomous_flight:
-        return AutonomousFlight(
-            config, navdb, sim_source, session, crew, brain, get_state,
-            on_event, use_route
-        )
-    return None
+) -> AutonomousFlight:
+    """The First Officer's machine, always built.
+
+    It used to exist only when the setting was on at startup, which made
+    the panel's engage button dead until a restart. The object is cheap
+    and inert until engaged -- ``_enabled`` (the setting, default off)
+    is what gates the tick, not the object's existence.
+    """
+    return AutonomousFlight(
+        config, navdb, sim_source, session, crew, brain, get_state,
+        on_event, use_route
+    )
 
 
 __all__ = ["AutonomousFlight", "AutonomousPhase", "AutonomousState", "create_autonomous_flight"]

@@ -211,6 +211,9 @@ class ControllerBrain:
         # by the engine as the answers arrive. Empty means nothing is known,
         # and nothing known is the ILS (see :mod:`wilcoatc.atc.approaches`).
         self.approach_data: dict[str, FieldApproaches] = {}
+        # The same airports' SIDs and STARs, decoded from the facility data
+        # by integrations.terminal_procedures for the First Officer.
+        self.terminal_procedures: dict = {}
         # Each runway end's pattern height above the field, as the
         # simulator's facility data gives it (integrations.runways), by
         # field. Behind the circuit files, ahead of the default.

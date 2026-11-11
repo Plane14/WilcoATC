@@ -1236,7 +1236,12 @@ cool (turbines), engines off, electrics off.
 climb and descent, NAV for the route, APR for the approach — while
 `direct` sets heading, altitude, vertical speed and indicated airspeed
 explicitly, for the aeroplanes whose autopilots do not fly managed legs.
-Every control goes through one place that tries the cleanest means first
+When the plan or the clearance names a SID or STAR, the First Officer reads
+that airport's procedures from the simulator's facility data and flies the
+matching transition's legs — the lateral path plus the published altitude
+and speed limits — until the path ends. A vector, and an assigned heading,
+level or speed, still outranks the procedure's own targets. Every control
+goes through one place that tries the cleanest means first
 and falls back where a model does not answer; a name the simulator does
 not know is remembered rather than asked again. `immersion.autonomous_use_sim_ai`
 is currently unused — there is no SimConnect path to the simulator's own
@@ -3667,9 +3672,9 @@ Every one of these behaviours can be switched off on its own under
 `immersion.controller` in `config.yaml`.
 
 Not done yet: AI traffic joining a hold, and the tower naming the taxiway to
-vacate by. Also pending is the sim session that brings the SID and RNAV
-constraints from the simulator's own procedure legs. Until then they're
-`# UNVERIFIED` in the code.
+vacate by. The First Officer now flies a filed or cleared SID/STAR from the
+simulator's facility legs; the approach transitions and RNAV final legs from
+the same data are still pending.
 
 ---
 

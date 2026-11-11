@@ -254,6 +254,23 @@
         text(el.linkText, sim ? t('tb.linked', 'LINKED') : t('tb.no_sim', 'NO SIM'));
     }
 
+    // The First Officer's chip beside the link: grey while the FO is off,
+    // lit while it flies, red where the machine has called an error. A
+    // tap engages; another lets go. What it shows is the engine's answer,
+    // not the ask.
+    function paintFo(state) {
+        var fo = state.autonomous || {};
+        var kind = fo.error ? ' is-error' : fo.enabled ? ' is-on' : '';
+        cls(el.fo, 'wa-fo' + kind);
+        var phase = fo.enabled && fo.phase && fo.phase !== 'complete'
+            ? ' ' + String(fo.phase).replace(/_/g, ' ') : '';
+        text(el.foText, fo.error ? t('tb.fo_failed', 'FO FAILED')
+            : fo.enabled ? t('tb.fo_on', 'FO FLYING') + phase
+            : t('tb.fo_off', 'FO OFF'));
+        el.fo.title = fo.error || t('tb.fo_why',
+            'Engage or stop the First Officer flying the aircraft');
+    }
+
     function paintRadio(state) {
         var radio = state.radio || {};
         var tuned = radio.com1 || 0;
@@ -666,6 +683,7 @@
     function paintState(state) {
         lastState = state;
         paintLink(state);
+        paintFo(state);
         paintRadio(state);
         paintStatus(state);
         paintReplies((state.flight || {}).phase || 'preflight');
@@ -717,6 +735,7 @@
     function wire() {
         var ids = {
             link: 'wa-link', linkText: 'wa-link-text', tabs: 'wa-tabs',
+            fo: 'wa-fo', foText: 'wa-fo-text',
             dot: 'wa-dot', freq: 'wa-freq', station: 'wa-station',
             standby: 'wa-standby', standbyName: 'wa-standby-name', swap: 'wa-swap',
             status: 'wa-status', feed: 'wa-feed', replies: 'wa-replies',
@@ -817,6 +836,12 @@
         el.swap.addEventListener('click', function () {
             if (!standby) return;
             request('POST', '/api/swap', { radio: 1 }, tick);
+        });
+        // The First Officer: engage where it shows off, stop where it
+        // shows on. The chip then shows what the engine answered.
+        el.fo.addEventListener('click', function () {
+            var now = (lastState && lastState.autonomous) || {};
+            request('POST', '/api/autonomous', { enabled: !now.enabled }, tick);
         });
         el.atis.addEventListener('click', function () {
             request('POST', '/api/atis', {});

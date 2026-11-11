@@ -26,6 +26,7 @@ import ctypes.wintypes as w
 import logging
 import struct
 import time
+from dataclasses import dataclass
 
 from ..atc.ground import GroundLayout
 from .facilities import find_simconnect
@@ -65,6 +66,19 @@ _RECV_FACILITY_DATA = 28
 _RECV_FACILITY_DATA_END = 29
 _DEF_ID = 0x5711
 _REQ_ID = 0x5712
+
+
+@dataclass(frozen=True)
+class FacilityRecord:
+    """One facility-data item with the hierarchy SimConnect reports."""
+
+    type: int
+    unique_id: int
+    parent_id: int
+    item_index: int
+    list_size: int
+    is_list_item: int
+    raw: bytes
 
 
 class _Recv(ctypes.Structure):
@@ -159,6 +173,26 @@ def ask_facility(dll_path: str, client: bytes, fields, ident: str,
     is the ICAO region an intersection's ident is unique in; an airport
     needs none.
     """
+    records = ask_facility_records(dll_path, client, fields, ident,
+                                   timeout_s=timeout_s, region=region)
+    if records is None:
+        return None
+    blocks: dict[int, list[bytes]] = {}
+    for record in records:
+        blocks.setdefault(record.type, []).append(record.raw)
+    return blocks
+
+
+def ask_facility_records(dll_path: str, client: bytes, fields, ident: str,
+                         timeout_s: float = 15.0,
+                         region: str = "") -> list[FacilityRecord] | None:
+    """The same request as :func:`ask_facility`, keeping the parent ids.
+
+    Procedure data is nested -- airport, departure or arrival, transition,
+    leg -- and SimConnect says which record owns which only through
+    ``ParentUniqueRequestId``. Callers that need that hierarchy use this;
+    the older block map is enough for flat lists.
+    """
     library = find_simconnect(dll_path)
     if library is None:
         return None
@@ -187,7 +221,7 @@ def ask_facility(dll_path: str, client: bytes, fields, ident: str,
                 handle, _DEF_ID, _REQ_ID, ident.encode("ascii", "ignore"),
                 region.encode("ascii", "ignore")) != 0:
             return None
-        blocks: dict[int, list[bytes]] = {}
+        records: list[FacilityRecord] = []
         data = ctypes.POINTER(_Recv)()
         size = w.DWORD()
         deadline = time.monotonic() + timeout_s
@@ -205,14 +239,25 @@ def ask_facility(dll_path: str, client: bytes, fields, ident: str,
                 raw = ctypes.string_at(
                     ctypes.addressof(block) + ctypes.sizeof(_FacilityData),
                     max(0, length))
-                blocks.setdefault(int(block.Type), []).append(raw)
+                records.append(FacilityRecord(
+                    type=int(block.Type), unique_id=int(block.UniqueRequestId),
+                    parent_id=int(block.ParentUniqueRequestId),
+                    item_index=int(block.ItemIndex),
+                    list_size=int(block.ListSize),
+                    is_list_item=int(block.IsListItem), raw=raw))
             elif which == _RECV_FACILITY_DATA_END:
                 break
             elif which in (_RECV_EXCEPTION, _RECV_QUIT):
                 return None
-        return blocks
+        return records
     finally:
         dll.SimConnect_Close(handle)
 
 
-__all__ = ["SimGround", "decode", "ask_facility"]
+__all__ = [
+    "FacilityRecord",
+    "SimGround",
+    "ask_facility",
+    "ask_facility_records",
+    "decode",
+]

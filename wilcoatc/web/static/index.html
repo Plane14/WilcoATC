@@ -71,6 +71,13 @@
       <!-- Only while it has something to say: transmitting, receiving, or
            the engine not answering. "Mic ready" all flight said nothing. -->
       <div class="pill solid" id="mic-pill" hidden><div class="dot"></div><span id="mic-text" data-i18n="mic.ready">Mic ready</span></div>
+      <!-- The First Officer, engaged and let go from here. Off until asked
+           for, like every autopilot: the dot is the FO flying, and the text
+           says what the machine is doing while it does it. -->
+      <button class="pill solid fo-toggle" id="fo-pill" type="button"
+              data-i18n-title="fo.title" title="First Officer">
+        <div class="dot"></div><span id="fo-text" data-i18n="fo.off">FO off</span>
+      </button>
       <!-- The time a pilot reads off a clock in the cockpit: UTC. The tuned
            frequency and who is on it are on the radio card already. Not on
            the Settings screen, where it has nothing to do with anything. -->

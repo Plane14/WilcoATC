@@ -309,12 +309,15 @@ class Engine:
         self.brain.hearing = self.config.speech
         # Autonomous flight (First Officer flying the aircraft). Built after
         # the brain it talks to; the session arrives with begin_flight.
-        self.autonomous_flight: AutonomousFlight | None = None
-        if self.config.immersion.autonomous_flight:
-            self.autonomous_flight = create_autonomous_flight(
+        # Always built: the panel's engage button needs the machine to
+        # exist before it can turn it on, and the object is inert while
+        # its enabled flag (the setting, default off) is clear.
+        self.autonomous_flight: AutonomousFlight | None = (
+            create_autonomous_flight(
                 self.config, self.navdb, None, None, self.crew, self.brain,
                 lambda: self.state, self.emit, use_route=self.use_route
             )
+        )
         # When the search for an enroute frequency last came up empty, so a
         # flight over a country that publishes none is not made to look for
         # one on every pass of the situation loop.
@@ -399,6 +402,11 @@ class Engine:
         from .integrations.approaches import SimApproaches
 
         self.simapproaches = SimApproaches(self.config.sim.simconnect_dll)
+        # And the SIDs and STARs each airport publishes, for the First
+        # Officer's procedure guidance (integrations.terminal_procedures).
+        from .integrations.terminal_procedures import SimProcedures
+
+        self.simprocedures = SimProcedures(self.config.sim.simconnect_dll)
         # And each runway's pattern altitude, behind the circuit files.
         from .integrations.runways import SimRunways
 
@@ -406,6 +414,7 @@ class Engine:
         # Where each field's runways have been said to come from (logs radio).
         self._runways_said: dict[str, str] = {}
         self._approaches_asked: set[str] = set()
+        self._procedures_asked: set[str] = set()
         self._ground_ready: dict[str, object] = {}
         # The controller taxis the pilot on the same layouts the traffic
         # drives on, and reaches them the way it reaches the traffic: handed
@@ -1777,11 +1786,65 @@ class Engine:
                      why="no flight plan loaded: distances are to the airport")
         return session
 
+    def engage_autonomous(self) -> tuple[bool, str]:
+        """The panel's engage: the First Officer takes the aeroplane now.
+
+        The machine is always built; what an engage does is start it
+        wherever the flight already is -- parked, taxiing or airborne --
+        rather than only at a session's beginning.
+        """
+        fo = self.autonomous_flight
+        if fo is None:
+            return False, "autonomous flight is not available"
+        try:
+            if not fo.engage(self.session):
+                # No session yet: the flag is set and the next
+                # begin_session starts the machine -- the button is not
+                # refused for want of a flight already in progress.
+                fo.enable()
+        except Exception as exc:
+            log.debug("autonomous engage failed", exc_info=True)
+            return False, str(exc)
+        self.emit("info", "First Officer flying", key="fo.engaged")
+        return True, ""
+
+    def disengage_autonomous(self) -> tuple[bool, str]:
+        """The panel's stop: the FO lets go, controls handed back neutral."""
+        fo = self.autonomous_flight
+        if fo is None:
+            return True, ""
+        try:
+            fo.disengage()
+        except Exception as exc:
+            log.debug("autonomous disengage failed", exc_info=True)
+            return False, str(exc)
+        self.emit("info", "First Officer has stopped flying",
+                  key="fo.disengaged")
+        return True, ""
+
+    def autonomous_status(self) -> dict:
+        """What the panel shows in the FO button."""
+        fo = self.autonomous_flight
+        if fo is None:
+            return {"available": False, "enabled": False, "phase": "",
+                    "sub": "", "helicopter": False, "error": ""}
+        try:
+            return fo.status()
+        except Exception:
+            log.debug("autonomous status raised", exc_info=True)
+            return {"available": False, "enabled": False, "phase": "",
+                    "sub": "", "helicopter": False, "error": ""}
+
     def use_route(self, route) -> None:
         """Take a route as the flight's, and say so in the transcript."""
         self.route = route if route else None
         self.brain.route = self.route
         self.route_progress = self.brain.route_progress = None
+        if self.route is not None:
+            # Whatever the plan filed or was cleared for: the field's
+            # procedure list is asked once, on the background thread.
+            self._ask_for_terminal_procedures(self.route.origin)
+            self._ask_for_terminal_procedures(self.route.destination)
         if self.route is None:
             decision("route", event="none", source=getattr(route, "source", ""),
                      why="the plan has fewer than two placed fixes")
@@ -3813,10 +3876,41 @@ class Engine:
         decision("airport", airport=ident, runways_from=source, ends=ends,
                  **self.navdb.runway_differences(ident))
 
+    def _ask_for_terminal_procedures(self, ident: str) -> None:
+        """The SIDs and STARs an airport publishes, once per field.
+
+        Asked on its own thread like the approaches: the facility data is
+        a paged walk of airport, procedures, transitions and legs, and
+        none of it should stall the controller's loop. The answer lands
+        in ``brain.terminal_procedures`` for the First Officer.
+        """
+        if not ident or ident in self._procedures_asked:
+            return
+        if not (self.state.source == "simconnect" and self.state.connected):
+            return
+        self._procedures_asked.add(ident)
+
+        def read() -> None:
+            try:
+                found = self.simprocedures.procedures(ident)
+            except Exception:
+                log.debug("could not read %s's procedures", ident,
+                          exc_info=True)
+                return
+            if found is not None:
+                self.brain.terminal_procedures[ident] = found
+                log.info("%s: terminal procedures from the simulator: "
+                         "%d departures, %d arrivals",
+                         ident, len(found.departures), len(found.arrivals))
+
+        threading.Thread(target=read, name=f"WilcoATC-procedures-{ident}",
+                         daemon=True).start()
+
     def _ask_for_approaches(self, ident: str) -> None:
         # Said whether or not the simulator can be asked: without it, the
         # row says the cache or the database is what is being used.
         self.say_runway_source(ident)
+        self._ask_for_terminal_procedures(ident)
         if not ident or ident in self._approaches_asked:
             return
         if not (self.state.source == "simconnect" and self.state.connected):

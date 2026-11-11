@@ -133,6 +133,7 @@ class Route:
     alternate: str = ""
     sid: str = ""
     sid_runway: str = ""
+    sid_transition: str = ""
     star: str = ""
     star_transition: str = ""
     star_runway: str = ""
@@ -487,7 +488,8 @@ def from_pln(text: str, resolve: Resolver | None = None) -> Route:
     fixes = _with_ends(fixes, plan.origin, plan.destination, resolve)
     return Route(fixes=tuple(fixes), origin=plan.origin,
                  destination=plan.destination, sid=plan.sid,
-                 sid_runway=plan.departure_runway, star=plan.star,
+                 sid_runway=plan.departure_runway,
+                 sid_transition=plan.sid_transition, star=plan.star,
                  star_transition=plan.star_transition,
                  star_runway=plan.arrival_runway, approach=plan.approach,
                  cruise_ft=plan.cruise_ft, source="pln", notes=tuple(notes))

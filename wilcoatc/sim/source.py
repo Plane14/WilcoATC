@@ -413,8 +413,12 @@ class SimConnectSource:
         ("NAV_GSI:1", "nav1_gsi", "raw", "slow"),
         ("NAV ACTIVE FREQUENCY:1", "nav1_freq", "navfreq", "slow"),
         ("AUTOPILOT_AIRSPEED_HOLD_VAR", "ap_airspeed_kt", "raw", "slow"),
+        # Whether an autothrottle is actually driving the levers -- the
+        # FO's throttle servo checks it before touching them, and the
+        # managed engage arms the AT only while this reads false.
+        ("AUTOTHROTTLE_ACTIVE", "autothrottle", "bool", "slow"),
         # The notices: power, and the fuel either side and by weight.
-        ("GENERAL_ENG_THROTTLE_LEVER_POSITION:1", "throttle_pct", "raw", "slow"),
+        ("GENERAL_ENG_THROTTLE_LEVER_POSITION:1", "throttle_pct", "throttle", "slow"),
         ("FUEL_LEFT_QUANTITY", "fuel_left_gal", "raw", "slow"),     # Gallons
         ("FUEL_RIGHT_QUANTITY", "fuel_right_gal", "raw", "slow"),   # Gallons
         ("FUEL_TOTAL_QUANTITY_WEIGHT", "fuel_total_lb", "raw", "slow"),  # lb
@@ -786,6 +790,13 @@ class SimConnectSource:
             # unit; anything over 100 can only be that scale.
             value = float(raw)
             return value / 163.84 if value > 100.0 else value
+        if kind == "throttle":
+            # The throttle lever variable reads back percent x100 on the
+            # 2024 SDK's SimConnect -- a 20% lever reports 2000 -- while
+            # writes take percent plainly. Anything over 100 can only be
+            # that doubled scale.
+            value = float(raw)
+            return value / 100.0 if value > 100.0 else value
         if kind == "fps_kt":
             # The design-performance speeds are asked for in the
             # wrapper's native feet per second.
