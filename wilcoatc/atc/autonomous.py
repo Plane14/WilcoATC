@@ -317,6 +317,9 @@ class AutonomousFlight:
         self._perf: Optional[fly.Performance] = None
         self._speeds: Optional[vspeeds.Speeds] = None
         self._fuel_known = False
+        # Consecutive empty-tank readings: a MAYDAY waits for the zero
+        # to repeat, a glitch reads once.
+        self._fuel_zero_reads = 0
         self._ga_flag_seen = False
         # The last few headwind samples on final, for the windshear
         # swing the watch works off.
@@ -3215,11 +3218,22 @@ class AutonomousFlight:
                                        capacity)
         if fuel_lb > 0.0 or fuel_gal > 0.0:
             self._fuel_known = True
-        if not self._fuel_known:
+        if not self._fuel_known or state.on_ground:
+            # A parked aeroplane is never in a fuel emergency: what is in
+            # the tanks is a fuelling order, which _departure_fuel_ok
+            # already judges before the takeoff roll. FUEL TOTAL QUANTITY
+            # also glitches low during engine start -- a single bad read
+            # used to MAYDAY the flight from its own parking spot.
             return
         if fuel_lb <= 0.0 and fuel_gal <= 0.0:
-            self._declare_emergency("fuel", state, mayday=True)
+            # One empty reading can be the sim hiccuping, not a dry tank.
+            # The MAYDAY waits for the reading to repeat; a tank that is
+            # really empty keeps reading empty.
+            self._fuel_zero_reads += 1
+            if self._fuel_zero_reads >= 3:
+                self._declare_emergency("fuel", state, mayday=True)
             return
+        self._fuel_zero_reads = 0
         needed = self._fuel_needed_gal(state)
         if needed is None or fuel_gal <= 0.0:
             if 0.0 < fuel_gal < 8.0:
