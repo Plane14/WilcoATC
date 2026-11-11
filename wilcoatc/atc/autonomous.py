@@ -40,10 +40,12 @@ from ..navdata.db import Airport, NavDB
 from ..sim.source import SimConnectSource
 from . import approach_flight, auto_nav, procedure_legs, vspeeds
 from . import flying as fly
+from . import interphone as ip
 from .ap import FlightDirector
+from .checklist import holds
 from .controller import ControllerBrain
 from .crew import CrewDirector
-from .session import FlightSession, Phase
+from .session import FlightSession, Phase, station_key
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +206,33 @@ class AutonomousState:
     ap_speed_mode: bool = False
     # Checklist tracking
     checklists_completed: set[str] = field(default_factory=set)
+    # The radios, worked by the FO itself: COM1 has been put on the
+    # departure field's position, which station was last checked in with,
+    # and what the session's squawk/altimeter were when they were last
+    # dialled in -- a new value is a new instruction to action.
+    comms_tuned: bool = False
+    checked_in_with: str = ""
+    squawk_dialled: str = ""
+    altimeter_dialled: float = 0.0
+    last_radio_at: float = 0.0
+    # The turnaround between chained legs: the plan being serviced for,
+    # whether the engines were shut and the fuel asked for, and where the
+    # diversion field is that the fuel figure was built on.
+    plan_flight: Optional[dict] = None
+    service_started_at: float = 0.0
+    gsx_asked: bool = False
+    gsx_busy: bool = False
+    fuel_wrote: bool = False
+    service_warned: bool = False
+    alternate: Optional[Airport] = None
+    # The warnings a flight gets once: overweight at the hold, the flap
+    # speed the schedule asked for and could not have, minimum fuel
+    # already said on the radio, and the short-of-diversion note at the
+    # hold.
+    mtow_warned: bool = False
+    flap_gate_warned: bool = False
+    minimum_fuel_said: bool = False
+    depart_fuel_warned: bool = False
     # Timing
     last_action_at: float = 0.0
 
@@ -245,6 +274,25 @@ class AutonomousFlight:
         self._chain_delay = config.immersion.autonomous_chain_delay_s
         self._request_ifr = config.immersion.autonomous_request_ifr
         self._use_sim_ai = config.immersion.autonomous_use_sim_ai
+        # The FO's own jobs while it flies: the radios, the turnaround
+        # fuelling between legs, and the reserve the legs are planned to.
+        self._manage_radio = getattr(
+            config.immersion, "autonomous_manage_comms", True)
+        self._turnaround_service = getattr(
+            config.immersion, "autonomous_service_turnaround", True)
+        self._reserve_min = float(getattr(
+            config.immersion, "autonomous_divert_reserve_min", 45.0) or 45.0)
+        # The biggest fuel_total_gal the model has ever shown: the
+        # capacity for a model that declares no FUEL TOTAL CAPACITY.
+        self._fuel_capacity_seen = 0.0
+        # Which checklist item the FO is working, and since when -- an
+        # item that cannot be made to hold is answered after the wait,
+        # not waited on for ever.
+        self._checklist_item_id = 0
+        self._checklist_item_since = 0.0
+        # When the squawk/altimeter were last pushed into the radios, so a
+        # dial that does not take is retried on a clock, not every tick.
+        self._dialled_at = 0.0
         self._dir: Optional[FlightDirector] = None
         self._perf: Optional[fly.Performance] = None
         self._speeds: Optional[vspeeds.Speeds] = None
@@ -549,15 +597,18 @@ class AutonomousFlight:
             return
         self._last_state = state
 
+        now = time.monotonic()
+
         # A helicopter is flown by its own controller, on every pass of the
         # loop rather than the fixed-wing action interval: the cyclic,
         # collective and pedals are closed-loop controls, not once-a-second
-        # mode selections.
+        # mode selections. The radio and the checklists are a FO's jobs
+        # whatever it flies, so they run from here either way.
+        self._manage_comms(state, now)
+        self._drive_checklist(state, now)
         if self._heli is not None:
             self._heli.tick(state)
             return
-
-        now = time.monotonic()
 
         # The phases that are flown by hand -- rotation, the flare, the
         # go-around's pitch, the taxi -- want a faster hand than the 1 Hz
@@ -681,16 +732,20 @@ class AutonomousFlight:
         if not getattr(state, "autopilot", False):
             d.autopilot(True)
         self.state.ap_master = True
+        lim = self._limits(state)
         if altitude:
-            d.altitude(altitude)
+            d.altitude(self._safe_altitude(state, altitude, lim))
         if heading >= 0.0:
             d.heading(heading)
             self.state.ap_hdg_mode = True
         if speed_kt:
+            speed_kt = self._safe_speed(state, speed_kt, lim)
             d.speed(speed_kt)
             self.state.ap_speed_mode = True
             self._manage_throttle(state, speed_kt)
         if vs_fpm:
+            vs_fpm = max(lim["vs_dn_fpm"], min(float(vs_fpm),
+                                             lim["vs_up_fpm"]))
             d.vertical_speed(vs_fpm)
             d.vs_hold(True)
             self.state.ap_vs_mode = True
@@ -741,9 +796,14 @@ class AutonomousFlight:
             return
         lever = self._lever_position(state)
         barber = float(getattr(state, "barber_pole_kt", 0.0) or 0.0)
+        max_mach = float(getattr(state, "mach_max_operate", 0.0)
+                         or getattr(state, "barber_pole_mach", 0.0) or 0.0)
+        mach = float(getattr(state, "airspeed_mach", 0.0) or 0.0)
         err = ias - target_kt
-        if barber > 0.0 and ias >= barber * 0.97:
-            # At the red line the lever comes down, whatever the target.
+        if (barber > 0.0 and ias >= barber * 0.97) \
+                or (max_mach > 0.0 and mach >= max_mach - 0.005):
+            # At the red line -- knots low down, mach high up -- the lever
+            # comes down, whatever the target.
             lever = min(lever - 0.10, 0.40)
         elif err > 8.0:
             lever -= min(0.20, 0.02 + err * 0.006)
@@ -754,6 +814,103 @@ class AutonomousFlight:
         lever = max(0.05, min(0.97, lever))
         self._last_lever = lever
         self.director.throttle(lever)
+
+    # -- the envelope ------------------------------------------------------
+
+    def _limits(self, state) -> dict:
+        """What the aeroplane may be asked to do, in the units it thinks in.
+
+        Every commanded figure goes through here. The red line is the
+        aeroplane's own barber pole or design VC where the model declares
+        them, else the class's cruise figure bounded up -- a table cruise
+        number is a cruise number, not a never-exceed. The stall floor is
+        the model's VS1 with margin. A field the model never publishes is
+        a conservative class default, not an exception to the envelope.
+        """
+        perf = self.performance
+        barber = float(getattr(state, "barber_pole_kt", 0.0) or 0.0)
+        design_vc = float(getattr(state, "design_vc_kt", 0.0) or 0.0)
+        vs1 = float(getattr(state, "design_vs1_kt", 0.0) or 0.0)
+        vs0 = float(getattr(state, "design_vs0_kt", 0.0) or 0.0)
+        max_ias = perf.cruise_kt * 1.35
+        if design_vc > 0.0:
+            max_ias = min(max_ias, design_vc)
+        if barber > 0.0:
+            max_ias = min(max_ias, barber * 0.95)
+        min_clean = vs1 * 1.3 if vs1 > 0.0 else 0.0
+        stall = vs0 or vs1 or 0.0
+        # Flap and gear speeds: the model publishes neither, so the
+        # figures are the class's -- where the type's own limits are
+        # higher, the lower number is still safe.
+        flap_max, gear_max = self._config_limits()
+        max_mach = float(getattr(state, "mach_max_operate", 0.0)
+                         or getattr(state, "barber_pole_mach", 0.0) or 0.0)
+        ceiling = float(getattr(perf, "ceiling_ft", 0.0) or 0.0)
+        return {
+            "max_ias_kt": max_ias,
+            "min_clean_kt": min_clean,
+            "stall_kt": stall,
+            "flap_max_kt": flap_max,
+            "gear_max_kt": gear_max,
+            "max_mach": max_mach,
+            "ceiling_ft": ceiling,
+            "vs_up_fpm": min(perf.climb_fpm, 4000.0),
+            "vs_dn_fpm": -min(perf.descend_fpm, 4000.0),
+        }
+
+    def _config_limits(self) -> tuple[float, float]:
+        """(max speed for any flap, for the gear down), by class.
+
+        An airliner works to roughly 250/265; a light aeroplane's manual
+        says 110-ish for the flaps and about 130 for the wheels. The
+        cruise figure is the proxy: it is the class's idea of how big the
+        aeroplane is.
+        """
+        if self.performance.cruise_kt >= 230.0:
+            return 250.0, 265.0
+        if self.performance.cruise_kt >= 140.0:
+            return 200.0, 200.0
+        return 110.0, 130.0
+
+    def _safe_speed(self, state, kt: float, lim: dict | None = None) -> float:
+        """An indicated-airspeed command inside the envelope."""
+        if lim is None:
+            lim = self._limits(state)
+        value = float(kt or 0.0)
+        if value <= 0.0:
+            return 0.0
+        return max(45.0, min(value, lim["max_ias_kt"]))
+
+    def _safe_altitude(self, state, ft: float, lim: dict | None = None) -> float:
+        """An altitude command under the ceiling, where one is known."""
+        if lim is None:
+            lim = self._limits(state)
+        value = float(ft or 0.0)
+        if lim["ceiling_ft"] > 0.0:
+            value = min(value, lim["ceiling_ft"])
+        return value
+
+    def _flaps_allowed(self, state) -> bool:
+        """Whether a flap may come out now: never past the flap speed."""
+        ias = float(getattr(state, "indicated_airspeed_kt", 0.0) or 0.0)
+        lim = self._limits(state)
+        if ias > lim["flap_max_kt"]:
+            if not self.state.flap_gate_warned:
+                self.state.flap_gate_warned = True
+                self._emit("info",
+                           f"Flaps held: {ias:.0f} kt is past the flap "
+                           "speed", "autonomous.limits.flaps")
+            return False
+        return True
+
+    def _set_flaps(self, state, fraction: float) -> None:
+        """Move the flap lever -- an extension is gated by the flap speed.
+
+        Retraction is always allowed: bringing them in early is a drag
+        penalty, never an airframe one.
+        """
+        if fraction <= 0.0 or self._flaps_allowed(state):
+            self.director.flaps(fraction)
 
     def _lever_position(self, state) -> float:
         """Where the levers are, 0..1, as the sim last reported them."""
@@ -767,6 +924,267 @@ class AutonomousFlight:
         if checklist_name not in self.state.checklists_completed:
             self.crew.checklists.start(checklist_name)
             self.state.checklists_completed.add(checklist_name)
+
+    # -- the radios ---------------------------------------------------------
+
+    def _fo_say(self, kind: str) -> bool:
+        """One transmission by the first officer, through the same speech
+        and the same parsing as the pilot's. False where the call was not
+        made -- nothing to say, or nobody to say it on."""
+        if self.crew.radio_call is None or self.crew.transmit is None:
+            return False
+        try:
+            text, why = self.crew.radio_call(kind)
+        except Exception:
+            log.debug("the first officer's %s call failed", kind,
+                      exc_info=True)
+            return False
+        if not text:
+            log.debug("first officer %s call not made: %s", kind, why)
+            return False
+        self.crew.transmit(text)
+        self.state.last_radio_at = time.monotonic()
+        return True
+
+    def _radio_quiet(self) -> bool:
+        try:
+            return not (self.crew.radio_busy
+                        and self.crew.radio_busy())
+        except Exception:
+            log.debug("could not tell whether the frequency is busy",
+                      exc_info=True)
+            return True
+
+    def _manage_comms(self, state, now: float) -> None:
+        """Work the radios the way the first officer flying would.
+
+        COM1 is put on the position the phase is worked through on the
+        ground -- delivery, ground, tower -- and on the station a handoff
+        names in the air. The squawk and the altimeter are dialled to the
+        figures the controller gave. A readback owed goes out before
+        anything volunteered, and a new airborne station is checked in
+        with once. Nothing is keyed while the frequency is busy, and
+        nothing at all while the radio has no power.
+        """
+        if not self._manage_radio:
+            return
+        sim = self.sim
+        session = self.session
+        if sim is None or not getattr(sim, "connected", False) \
+                or session is None:
+            return
+        if self.state.phase in (AutonomousPhase.INIT,
+                                AutonomousPhase.COMPLETE,
+                                AutonomousPhase.ERROR):
+            return
+        from .radio_power import decide
+
+        powered, _why = decide(state)
+        if not powered or not self._radio_quiet():
+            return
+
+        # The dials are worked whatever else the frequency is doing: they
+        # are knob-turns, not transmissions.
+        self._dial_radios(state, now)
+
+        # A readback owed goes before anything the FO would volunteer --
+        # a controller who has spoken is answered first.
+        pending = getattr(session, "pending", None)
+        if pending is not None and pending.readback_required \
+                and not pending.read_back:
+            if now - self.state.last_radio_at >= 4.0:
+                self._fo_say("readback")
+            return
+
+        # A handoff: the number it named is tuned, and the new station is
+        # checked in with below once the engine has seen the retune.
+        handed = getattr(session, "handoff_pending", None)
+        if handed is not None and getattr(handed, "mhz", 0.0):
+            freq = float(handed.mhz)
+            active = float(getattr(state, "com1_active", 0.0) or 0.0)
+            if abs(active - freq) > 0.004:
+                if now - self._dialled_at >= 6.0 and sim.set_com(freq, 1):
+                    self._dialled_at = now
+                    self._emit("info", f"COM1 to {freq:.3f}",
+                               "autonomous.comms.tune")
+                return
+
+        # On the ground at the field the leg leaves from, COM1 belongs to
+        # the position that works this phase. In the air the frequency is
+        # only changed by a handoff.
+        if state.on_ground:
+            self._tune_for_phase(state, session, now)
+
+        # A new airborne station is checked in with: the level, and
+        # whether it is being climbed or descended to. Ground positions
+        # are talked to by the calls that ask for things, and a station
+        # the flight is already established with needs nothing.
+        current = getattr(session, "current_station", None)
+        if current is None \
+                or getattr(current, "position", "") in ("DEL", "GND") \
+                or (state.on_ground and handed is None):
+            return
+        if session.established_with(current):
+            return
+        key = station_key(current)
+        fresh = key != self.state.checked_in_with
+        if (fresh or now - self.state.last_radio_at >= 60.0) \
+                and now - self.state.last_radio_at >= 4.0 \
+                and self._fo_say("check_in"):
+            self.state.checked_in_with = key
+
+    def _tune_for_phase(self, state, session, now: float) -> None:
+        """COM1 on the position the ground phase is worked through."""
+        want = {"preflight": "DEL", "request_clearance": "DEL",
+                "pushback": "GND", "taxi_out": "GND",
+                "holding_short": "TWR", "line_up": "TWR",
+                "takeoff": "TWR"}.get(self.state.phase.value)
+        if want is None:
+            return
+        airport = session.departure or self._get_current_airport()
+        if airport is None:
+            return
+        station = self.navdb.station_for(airport.ident, want)
+        if station is None or not getattr(station, "mhz", 0.0):
+            return
+        active = float(getattr(state, "com1_active", 0.0) or 0.0)
+        if abs(active - float(station.mhz)) <= 0.004:
+            return
+        if now - self._dialled_at < 8.0:
+            return
+        if self.sim.set_com(float(station.mhz), 1):
+            self._dialled_at = now
+            self._emit("info", f"COM1 to {station.callsign} "
+                       f"{float(station.mhz):.3f}", "autonomous.comms.tune")
+
+    def _dial_radios(self, state, now: float) -> None:
+        """Squawk and altimeter as the controller gave them, dialled once."""
+        session = self.session
+        want = "".join(c for c in str(getattr(session, "squawk", "") or "")
+                       if c.isdigit())[:4]
+        if want and want != self.state.squawk_dialled:
+            have = "".join(
+                c for c in str(getattr(state, "transponder_code", ""))
+                if c.isdigit())[:4]
+            if have == want:
+                self.state.squawk_dialled = want
+            elif now - self._dialled_at >= 5.0 \
+                    and self.sim.set_squawk(want):
+                self._dialled_at = now
+        alt = float(getattr(session, "altimeter", 0.0) or 0.0)
+        if alt > 0.0 and abs(alt - self.state.altimeter_dialled) > 0.2:
+            have = float(getattr(state, "kohlsman_hpa", 0.0) or 0.0)
+            if have > 0.0 and abs(have - alt) <= 0.5:
+                self.state.altimeter_dialled = alt
+            elif now - self._dialled_at >= 5.0:
+                self.director.kohlsman(alt)
+                self._dialled_at = now
+
+    # -- the checklist, answered by the FO flying ---------------------------
+
+    def _drive_checklist(self, state, now: float) -> None:
+        """Work an open checklist: do the item, then answer it.
+
+        A pilotless aeroplane has nobody for the first officer to wait
+        on, so when a run is waiting on an item the FO does the item --
+        the runner's own check says whether the aeroplane agrees -- and
+        answers it itself. A held run is carried on after a pause; a run
+        still being read out is left to finish being said. The answer is
+        the runner's ``fo_answer``: the same verification a spoken answer
+        gets, so a switch the simulator says is still wrong is objected
+        to, never waved through.
+        """
+        runner = self.crew.checklists
+        if runner is None:
+            return
+        item, run_state = runner.pending()
+        if item is None:
+            self._checklist_item_id = 0
+            return
+        if id(item) != self._checklist_item_id:
+            self._checklist_item_id = id(item)
+            self._checklist_item_since = now
+            return
+        if run_state == "held":
+            if now - self._checklist_item_since > 4.0:
+                runner.hear(ip.Said(who=ip.FIRST_OFFICER, what=ip.CONTINUE))
+                self._checklist_item_since = now
+            return
+        if run_state != "waiting":
+            return
+        # Do the item where the check names a variable the FO can reach;
+        # the answer goes once the simulator has had a moment to show it.
+        if self._perform_check_item(state, item):
+            self._checklist_item_since = now
+            return
+        if now - self._checklist_item_since >= 2.0:
+            runner.fo_answer()
+            # The next pass sees the advance -- or the objection, which a
+            # re-performed item then answers.
+            self._checklist_item_since = now
+
+    def _perform_check_item(self, state, item) -> bool:
+        """Move the switch an item's check names, where it disagrees.
+
+        True where a control was asked for, so the item is answered on a
+        later pass once the new value shows. An item whose check names
+        nothing the FO can reach, or nothing at all, is not performed --
+        the answer simply reports what is.
+        """
+        check = getattr(item, "check", None)
+        if check is None:
+            return False
+        runner = self.crew.checklists
+        try:
+            expected = runner._expected(check)
+        except Exception:
+            expected = check.value
+        actual = getattr(state, check.var, None)
+        if holds(check, actual, expected):
+            return False
+        return self._switch_for(state, check.var, expected)
+
+    def _switch_for(self, state, var: str, expected) -> bool:
+        """The cockpit control behind a checklist variable."""
+        d = self.director
+        want_on = (expected is True) or expected == "on" \
+            or (isinstance(expected, (int, float))
+                and not isinstance(expected, bool) and expected > 0)
+        table = {
+            "parking_brake": lambda: d.parking_brake(want_on),
+            "gear_down": lambda: d.gear(want_on),
+            "landing_light": lambda: d.landing_light(want_on),
+            "taxi_light": lambda: d.taxi_light(want_on),
+            "nav_light": lambda: d.nav_lights(want_on),
+            "strobe_light": lambda: d.strobes(want_on),
+            "beacon_light": lambda: d.beacon(want_on),
+            "pitot_heat": lambda: d.pitot_heat(want_on),
+            "seatbelt_sign": lambda: d.seatbelts(want_on),
+            "battery_master": lambda: d.battery(want_on),
+            "avionics_master": lambda: d.avionics(want_on),
+            "spoilers_armed": lambda: d.spoilers_arm(want_on),
+            "autopilot": lambda: d.autopilot(want_on),
+            "autothrottle": lambda: (d.autothrottle_arm() if want_on
+                                     else d.autothrottle_disconnect()),
+            "gps_drives_nav1": lambda: d.nav_source(1 if want_on else 0),
+            "fuel_selector": lambda: d.write("FUEL TANK SELECTOR:1",
+                                             float(expected)),
+            "mixture_pct": lambda: d.write("GENERAL ENG MIXTURE LEVER "
+                                           "POSITION:1", float(expected)),
+            "transponder_code": lambda: d.transponder(str(expected)),
+            "kohlsman_hpa": lambda: d.kohlsman(float(expected)),
+            "flaps_index": lambda: d.flaps(min(1.0, float(expected) / 4.0)),
+            "spoilers": lambda: d.spoilers(min(1.0, float(expected))),
+        }
+        action = table.get(var)
+        if action is None:
+            return False
+        try:
+            action()
+        except Exception:
+            log.debug("checklist switch %s failed", var, exc_info=True)
+            return False
+        return True
 
     def _configure_for_takeoff(self, state) -> None:
         """Set flaps, trim, lights for takeoff."""
@@ -989,10 +1407,73 @@ class AutonomousFlight:
         self._run_checklist_for_phase("before_takeoff")
 
         # "Line up and wait" puts the aeroplane on the runway; the takeoff
-        # clearance is what starts the roll.
+        # clearance is what starts the roll. The aeroplane only goes if it
+        # is light enough and the pavement is long enough for it.
         if self.session.lined_up or self.session.cleared_takeoff \
                 or self.session.phase in (Phase.LINED_UP, Phase.TAKEOFF):
+            if not self._departure_possible(state):
+                return
             self._transition(AutonomousPhase.LINE_UP)
+
+    def _departure_possible(self, state) -> bool:
+        """Whether the aeroplane may be taken onto the runway at all.
+
+        The weight the sim reports against the gross the model declares,
+        and the pavement against the takeoff run the model suggests. A
+        model that publishes neither is taken on trust; one that does is
+        held to it -- an overweight aeroplane does not get flown off.
+        """
+        mtow = float(getattr(state, "max_gross_weight_lb", 0.0) or 0.0)
+        weight = float(getattr(state, "total_weight_lb", 0.0) or 0.0)
+        if mtow > 0.0 and weight > mtow * 1.02:
+            self._set_error(f"Overweight: {weight:.0f} lb for a "
+                            f"{mtow:.0f} lb maximum takeoff weight")
+            return False
+        if self.state.runway_heading <= 0:
+            self._find_runway(state)
+        need = float(getattr(state, "suggested_runway_takeoff_ft", 0.0)
+                     or 0.0)
+        have = float(self.state.runway_length_ft or 0.0)
+        if need > 0.0 and have > 0.0 and have < need * 0.9 \
+                and not self.state.mtow_warned:
+            # Warned rather than refused: the model's suggestion is a
+            # book figure, not a measured run, and the runway data can
+            # equally be the one that is off.
+            self.state.mtow_warned = True
+            self._emit("info",
+                       f"Runway {have:.0f} ft for a suggested {need:.0f} "
+                       "ft takeoff run", "autonomous.limits.runway")
+        return self._departure_fuel_ok(state)
+
+    def _departure_fuel_ok(self, state) -> bool:
+        """Whether the tanks cover the leg with its diversion and reserve.
+
+        What a crew signs for: enough to reach the destination, divert to
+        the alternate and land with the reserve. The diversion figure is
+        the aim -- under it is said once and flown with care; under the
+        leg with the reserve alone is not a departure.
+        """
+        needed = self._fuel_needed_gal(state, estimate=True)
+        if needed is None:
+            return True
+        fuel_gal = float(getattr(state, "fuel_total_gal", 0.0) or 0.0)
+        if fuel_gal <= 0.0:
+            return True
+        if fuel_gal < needed["leg_gal"] + needed["reserve_gal"]:
+            self._set_error(
+                f"Not enough fuel: {fuel_gal:.0f} gal for a leg needing "
+                f"{needed['total_gal']:.0f} with the diversion")
+            return False
+        if fuel_gal < needed["total_gal"] \
+                and not self.state.depart_fuel_warned:
+            self.state.depart_fuel_warned = True
+            alt = needed.get("alternate")
+            self._emit("info",
+                       f"Departing short of the diversion figure: "
+                       f"{fuel_gal:.0f} gal, {needed['total_gal']:.0f} "
+                       f"planned via {alt.ident if alt else 'no alternate'}",
+                       "autonomous.fuel.short")
+        return True
 
     def _phase_line_up(self, state, now: float) -> None:
         """Line up on runway and prepare for takeoff."""
@@ -1247,10 +1728,10 @@ class AutonomousFlight:
             self.director.gear(True)
             self.state.configured = "gear"
         if agl < 5000 and self.state.configured in ("", "gear"):
-            self.director.flaps(0.25)
+            self._set_flaps(state, 0.25)
             self.state.configured = "flaps_approach"
         if agl < 2500 or (distance is not None and distance < 8.0):
-            self.director.flaps(0.5)
+            self._set_flaps(state, 0.5)
             self.state.configured = "flaps_final"
             self.director.spoilers_arm(True)
 
@@ -1543,22 +2024,200 @@ class AutonomousFlight:
             self._transition(AutonomousPhase.COMPLETE)
 
     def _phase_chain_next(self, state, now: float) -> None:
-        """Load and start next flight in chain with random destination."""
-        if self.state.chain_flight_index >= len(self.state.chain_flights):
-            self._select_next_destination()
-        if self.state.chain_flight_index >= len(self.state.chain_flights):
-            self._emit("info", "No suitable destination found for next flight",
-                       "autonomous.chain.no_destination")
-            self._transition(AutonomousPhase.SHUTDOWN)
+        """Turn the aeroplane around and load the next leg of the chain.
+
+        ``pick`` chooses the destination, ``delay`` gives the stand its
+        moment, ``service`` shuts the engines down and fuels for the leg
+        with its diversion, and ``load`` files the leg and starts it.
+        """
+        sub = self.state.sub or "pick"
+
+        if sub == "pick":
+            if self.state.chain_flight_index >= len(self.state.chain_flights):
+                self._select_next_destination()
+            if self.state.chain_flight_index >= len(self.state.chain_flights):
+                self._emit("info",
+                           "No suitable destination found for next flight",
+                           "autonomous.chain.no_destination")
+                self._transition(AutonomousPhase.SHUTDOWN)
+                return
+            self.state.plan_flight = self.state.chain_flights[
+                self.state.chain_flight_index]
+            self._goto_sub("delay")
             return
 
-        if now - self.state.phase_entered_at < self._chain_delay:
+        if sub == "delay":
+            if now - self.state.phase_entered_at < self._chain_delay:
+                return
+            self._goto_sub("service")
+
+        if sub == "service":
+            if self._service_turnaround(state, now):
+                self._goto_sub("load")
             return
 
-        next_flight = self.state.chain_flights[self.state.chain_flight_index]
-        self.state.chain_flight_index += 1
-        self._load_next_flight(next_flight)
-        self._transition(AutonomousPhase.PREFLIGHT)
+        if sub == "load":
+            self.state.chain_flight_index += 1
+            self._load_next_flight(self.state.plan_flight)
+            self.state.plan_flight = None
+            self._transition(AutonomousPhase.PREFLIGHT)
+
+    # -- the turnaround between legs ------------------------------------------
+
+    def _service_turnaround(self, state, now: float) -> bool:
+        """Fuel and service for the next leg; True when it may be loaded.
+
+        The engines go off before a hose comes anywhere near the
+        aeroplane. The fuel figure is the leg's own plus the diversion to
+        the alternate and the reserve -- what a crew would sign for, not
+        merely enough to reach the destination. GSX is asked first where
+        the stand can ask; a model whose tanks are writable is fuelled
+        directly where GSX cannot. A leg that cannot be fuelled for is
+        not departed on: the chain ends at the stand rather than in the
+        air short of fuel.
+        """
+        if not self._turnaround_service:
+            return True
+        if self.state.service_started_at == 0.0:
+            self.state.service_started_at = now
+
+        # Engines off first: nobody refuels a running aeroplane, and a
+        # rotor that is still turning is worse than a jet that is.
+        if getattr(state, "engines_running", False):
+            self._shutdown_engines()
+            if now - self.state.service_started_at < 60.0:
+                return False
+            self._emit("info",
+                       "Turnaround: engines still running, servicing anyway",
+                       "autonomous.service.engines")
+        rotor = float(getattr(state, "rotor_rpm_pct", 0.0) or 0.0)
+        if self._is_helicopter and rotor > 1.0:
+            if now - self.state.service_started_at < 90.0:
+                return False
+
+        plan = self.state.plan_flight or {}
+        dest = (self.navdb.airport(plan.get("destination", "") or "")
+                or self.session.destination)
+        if self.state.alternate is None:
+            self.state.alternate = self._pick_alternate(state, dest)
+        needed = self._fuel_needed_gal(state, destination=dest,
+                                       alternate=self.state.alternate,
+                                       estimate=True)
+        fuel_gal = float(getattr(state, "fuel_total_gal", 0.0) or 0.0)
+        self._fuel_capacity_seen = max(
+            self._fuel_capacity_seen, fuel_gal,
+            float(getattr(state, "fuel_capacity_gal", 0.0) or 0.0))
+        if needed is not None:
+            target = needed["total_gal"]
+        elif self._fuel_capacity_seen > 0.0:
+            # No burn figure to plan by: fill most of what it holds.
+            target = self._fuel_capacity_seen * 0.9
+        else:
+            target = fuel_gal
+        if self._fuel_capacity_seen > 0.0:
+            target = min(target, self._fuel_capacity_seen)
+        short = target - fuel_gal
+
+        # What is already aboard may be enough -- tanks that were filled
+        # for a longer leg cover a shorter one.
+        if short <= 0.5:
+            self._emit("info",
+                       f"Turnaround: {fuel_gal:.0f} gal aboard covers the "
+                       "leg, the diversion and the reserve",
+                       "autonomous.service.enough")
+            return True
+
+        # GSX first, where the stand can ask for a truck.
+        if not self.state.gsx_asked:
+            self.state.gsx_asked = True
+            asked = self._ask_gsx_refuel()
+            if asked:
+                self.state.gsx_busy = True
+                self._emit("info", f"Turnaround: {asked}",
+                           "autonomous.service.gsx")
+                return False
+            # No truck to ask: the tanks are written where the model's
+            # fuel system accepts a write.
+            if self._write_fuel(target):
+                return True
+            self._fuel_or_hold(state, needed, fuel_gal, target)
+            return self.state.phase != AutonomousPhase.SHUTDOWN
+
+        # A truck was asked: wait for GSX to say the fuel is on, then
+        # check the figure the tanks now report.
+        if self.state.gsx_busy:
+            if self._gsx_refuel_done() \
+                    or now - self.state.service_started_at > 300.0:
+                self.state.gsx_busy = False
+                fuel_gal = float(getattr(state, "fuel_total_gal", 0.0)
+                                 or 0.0)
+                if fuel_gal >= target - 0.5 or self._write_fuel(target):
+                    return True
+                self._fuel_or_hold(state, needed, fuel_gal, target)
+                return self.state.phase != AutonomousPhase.SHUTDOWN
+            return False
+        return False
+
+    def _ask_gsx_refuel(self) -> str:
+        """Ask GSX for the fuel truck; the words it was asked in, or ""."""
+        ground = getattr(self.brain, "ground", None)
+        if ground is None or not getattr(ground, "can_ask", False):
+            return ""
+        try:
+            return ground.request("refuel") or ""
+        except Exception:
+            log.debug("GSX refuel request failed", exc_info=True)
+            return ""
+
+    def _gsx_refuel_done(self) -> bool:
+        """Whether GSX says the refuelling is finished."""
+        ground = getattr(self.brain, "ground", None)
+        gstate = getattr(ground, "state", None) if ground is not None else None
+        if gstate is None or not getattr(gstate, "available", False):
+            return False
+        from ..integrations.gsx import COMPLETED, FINISHED
+        return gstate.refuelling in (COMPLETED, FINISHED)
+
+    def _write_fuel(self, gallons: float) -> bool:
+        """The tanks written to the figure, where the model allows it."""
+        if self.sim is None or not getattr(self.sim, "connected", False):
+            return False
+        try:
+            if self.sim.set_fuel(gallons):
+                self.state.fuel_wrote = True
+                self._emit("info",
+                           f"Turnaround: fuelled to {gallons:.0f} gal",
+                           "autonomous.service.fuel")
+                return True
+        except Exception:
+            log.debug("turnaround refuel failed", exc_info=True)
+        return False
+
+    def _fuel_or_hold(self, state, needed, fuel_gal: float,
+                      target: float) -> None:
+        """Nobody could bring fuel: go on what is aboard, or do not go.
+
+        Enough for the leg and the reserve -- the diversion figure aside
+        -- is departed with, said once; less than the leg itself is not
+        departed on at all.
+        """
+        if needed is not None and fuel_gal >= needed["leg_gal"] \
+                + needed["reserve_gal"]:
+            self._emit("info",
+                       f"Turnaround: no fuel to be had -- departing on "
+                       f"{fuel_gal:.0f} gal, short of the diversion "
+                       "figure", "autonomous.service.short")
+            return
+        if needed is None and fuel_gal > 0.0:
+            self._emit("info",
+                       f"Turnaround: no fuel to be had -- departing on "
+                       f"{fuel_gal:.0f} gal", "autonomous.service.short")
+            return
+        self._emit("error",
+                   f"Turnaround: cannot fuel for the leg ({fuel_gal:.0f} "
+                   f"gal aboard, {target:.0f} needed) -- ending here",
+                   "autonomous.service.nofuel")
+        self._transition(AutonomousPhase.SHUTDOWN)
 
     def _phase_error(self, state, now: float) -> None:
         """Error state - disable autonomous flight."""
@@ -2173,10 +2832,10 @@ class AutonomousFlight:
             if state.gear_down is not False:
                 d.gear(True)
         if distance is not None and distance < 6.0 and agl < 2500:
-            d.flaps(0.75)
+            self._set_flaps(state, 0.75)
             self.state.configured = "flaps_landing"
         if distance is not None and distance < 3.0:
-            d.flaps(1.0)
+            self._set_flaps(state, 1.0)
             self.state.configured = "flaps_full"
         d.spoilers_arm(True)
         # Approach speed: Vapp where known, the type's figure otherwise.
@@ -2275,6 +2934,9 @@ class AutonomousFlight:
         self.state.stabilized = False
         self.state.configured = ""
         self.state.ap_apr_mode = False
+        # The tower hears it: a missed approach is called, not just flown.
+        if self._manage_radio:
+            self._fo_say("going_around")
         self._emit("info", "Going around", "autonomous.go_around")
 
     def _fly_go_around(self, state, now: float) -> None:
@@ -2318,9 +2980,12 @@ class AutonomousFlight:
     def _monitor_emergency(self, state, now: float) -> None:
         """Watch for the failures the state can actually see.
 
-        Fuel and electrical are readable; an engine failure is only
-        visible as ``engines_running`` going false or the takeoff roll
-        not accelerating. What cannot be seen is not invented.
+        Fuel, the bus and per-engine combustion are readable; what cannot
+        be seen is not invented. All engines out is a MAYDAY; one out of
+        several is a PAN PAN and a diversion, because a twin on one is an
+        urgency, not yet a distress. Fuel is judged the way a crew plans
+        it: under the leg alone is the MAYDAY; under leg + diversion +
+        reserve is minimum fuel, a PAN PAN.
         """
         if self.state.emergency_declared or self.state.phase in (
                 AutonomousPhase.PREFLIGHT, AutonomousPhase.PUSHBACK,
@@ -2331,31 +2996,163 @@ class AutonomousFlight:
         # Electrical: the main bus collapsing in the air.
         volts = getattr(state, "main_bus_volts", -1.0)
         if volts is not None and 0.0 < volts < 12.0 and not state.on_ground:
-            self._declare_emergency("electrical", state)
+            self._declare_emergency("electrical", state, mayday=True)
             return
+
+        # Engines: combustion per engine where the model reports it.
+        if not state.on_ground:
+            engines_out = self._engines_out(state)
+            count = int(getattr(state, "engine_count", 0) or 0) or 1
+            if engines_out >= count:
+                self._declare_emergency("engine", state, mayday=True)
+                return
+            if engines_out > 0:
+                self._declare_emergency("engine-out", state, mayday=False)
+                return
 
         # Fuel: nothing left, or so little the destination cannot be
         # reached. A sim that never reports fuel reads zero forever, so
         # the check only fires once a nonzero figure has been seen.
         fuel_lb = getattr(state, "fuel_total_lb", 0.0) or 0.0
         fuel_gal = getattr(state, "fuel_total_gal", 0.0) or 0.0
+        capacity = float(getattr(state, "fuel_capacity_gal", 0.0) or 0.0)
+        self._fuel_capacity_seen = max(self._fuel_capacity_seen, fuel_gal,
+                                       capacity)
         if fuel_lb > 0.0 or fuel_gal > 0.0:
             self._fuel_known = True
-        if self._fuel_known:
-            if fuel_lb <= 0.0 and fuel_gal <= 0.0:
-                self._declare_emergency("fuel", state)
-                return
-            if fuel_gal > 0 and fuel_gal < 8.0:
-                self._declare_emergency("fuel", state)
-                return
-        # Engines out in the air: the sim's own flag is the only truth.
-        if not state.on_ground and not getattr(state, "engines_running", True):
-            self._declare_emergency("engine", state)
+        if not self._fuel_known:
+            return
+        if fuel_lb <= 0.0 and fuel_gal <= 0.0:
+            self._declare_emergency("fuel", state, mayday=True)
+            return
+        needed = self._fuel_needed_gal(state)
+        if needed is None or fuel_gal <= 0.0:
+            if 0.0 < fuel_gal < 8.0:
+                self._declare_emergency("fuel", state, mayday=True)
+            return
+        if fuel_gal < needed["leg_gal"]:
+            self._declare_emergency("fuel", state, mayday=True)
+        elif fuel_gal < needed["total_gal"] \
+                and not self.state.minimum_fuel_said:
+            self.state.minimum_fuel_said = True
+            self._declare_emergency("minimum fuel", state, mayday=False)
 
-    def _declare_emergency(self, kind: str, state) -> None:
-        """A MAYDAY, a divert, and the flight plan changed to match."""
+    def _engines_out(self, state) -> int:
+        """How many engines are not combusting, of those the sim reports.
+
+        ``engines_running`` is engine one's combustion; a model that
+        reports no combustion variables answers nothing, and nothing is
+        invented.
+        """
+        out = 0
+        for flag in (getattr(state, "engines_running", None),
+                     getattr(state, "eng2_combustion", None),
+                     getattr(state, "eng3_combustion", None),
+                     getattr(state, "eng4_combustion", None)):
+            if flag is not None and not flag:
+                out += 1
+        return out
+
+    # -- fuel planning -------------------------------------------------------
+
+    def _lb_per_gal(self) -> float:
+        """The fuel's weight per gallon: Jet-A on a turbine, avgas else."""
+        return 6.7 if self._is_turbine(None) else 6.0
+
+    def _fuel_flow_pph(self, state, estimate: bool = False) -> float:
+        """Pounds an hour the type burns in cruise, or 0 where unknown.
+
+        The model's own ESTIMATED FUEL FLOW is the only honest answer for
+        an in-flight emergency -- a guessed flow is how an aeroplane with
+        plenty aboard gets a minimum-fuel call. For the turnaround's fuel
+        order, where erring costs a fuller tank rather than a distress,
+        the engine type's rough figure stands in.
+        """
+        flow = float(getattr(state, "est_fuel_flow_pph", 0.0) or 0.0)
+        if flow > 0.0 or not estimate:
+            return flow
+        kind = int(getattr(state, "engine_type", -1) or -1)
+        if self._is_helicopter or kind == 3:
+            return 300.0
+        return {0: 80.0, 1: 4500.0, 5: 900.0}.get(kind, 1200.0)
+
+    def _reserve_hours(self) -> float:
+        """The reserve the legs are planned to, in hours."""
+        return max(0.25, self._reserve_min / 60.0)
+
+    def _pick_alternate(self, state, destination=None) -> Optional[Airport]:
+        """The nearest field that can take the aeroplane, for the reserve.
+
+        What a crew files: the closest suitable airport to the
+        destination that is not the destination itself. None where there
+        is no other field in reach -- an aeroplane with no alternate gets
+        no alternate fuel figure, and is not penalised for a field that
+        does not exist.
+        """
+        dest = destination or self.session.destination
+        if dest is None:
+            return None
+        for airport, _dist in self.navdb.nearest_airports(
+                dest.lat, dest.lon, limit=8, max_nm=120.0,
+                require_runway=not self._is_helicopter):
+            if airport.ident == dest.ident:
+                continue
+            if self._airport_suitable(airport):
+                return airport
+        return None
+
+    def _fuel_needed_gal(self, state, destination=None,
+                         alternate=None, estimate: bool = False) -> dict | None:
+        """Gallons the rest of the leg needs, broken down for the caller.
+
+        ``leg_gal`` reaches the destination; ``total_gal`` is leg +
+        diversion to the alternate + the reserve, the figure a crew may
+        not go below without saying so. None where the burn or the field
+        is not known -- then no emergency is ever projected on a guess.
+        """
+        flow = self._fuel_flow_pph(state, estimate=estimate)
+        dest = destination or self.session.destination
+        if flow <= 0.0 or dest is None \
+                or not getattr(state, "has_position", False):
+            return None
+        speed = max(60.0, float(getattr(state, "ground_speed_kt", 0.0)
+                                or self.performance.cruise_kt or 120.0))
+        leg_nm = state.distance_to(dest.lat, dest.lon)
+        leg_hr = leg_nm / speed
+        alt = alternate if alternate is not None \
+            else self._pick_alternate(state, dest)
+        divert_hr = 0.0
+        if alt is not None:
+            divert_hr = max(15.0, haversine_nm(
+                dest.lat, dest.lon, alt.lat, alt.lon)) / speed
+        per_gal = self._lb_per_gal()
+        leg_gal = leg_hr * flow / per_gal
+        divert_gal = divert_hr * flow / per_gal
+        reserve_gal = self._reserve_hours() * flow / per_gal
+        unusable = float(getattr(state, "fuel_unusable_gal", 0.0) or 0.0)
+        return {"leg_gal": leg_gal + unusable,
+                "divert_gal": divert_gal,
+                "reserve_gal": reserve_gal,
+                "total_gal": leg_gal + divert_gal + reserve_gal + unusable,
+                "alternate": alt}
+
+    def _declare_emergency(self, kind: str, state, mayday: bool = True) -> None:
+        """The call, the squawk, a divert, and the plan changed to match.
+
+        A distress is MAYDAY and squawked 7700; an urgency is PAN PAN --
+        one engine of several, minimum fuel, an electrical problem that
+        still leaves a radio. The session hears either way, because the
+        transmission goes through the ordinary parser like a pilot's.
+        """
         self.state.emergency = kind
         self.state.emergency_declared = True
+        # An emergency ends the chain: nobody flies the next leg on one.
+        self._chained = False
+        if mayday:
+            try:
+                self.sim.set_squawk("7700")
+            except Exception:
+                pass
         # Nearest airport that can take the aeroplane, for the divert.
         current = self._get_current_airport()
         if current is not None:
@@ -2369,7 +3166,8 @@ class AutonomousFlight:
         dest_name = dest.ident if dest is not None else "nearest airport"
         callsign = getattr(getattr(self.session.aircraft, "callsign", None),
                            "written", "") or "this aircraft"
-        text = (f"Mayday mayday mayday, {callsign} "
+        prefix = "Mayday mayday mayday" if mayday else "Pan pan pan pan"
+        text = (f"{prefix}, {callsign} "
                 f"{kind} emergency, diverting to {dest_name}")
         if self.crew.transmit:
             try:
@@ -2656,9 +3454,27 @@ class AutonomousFlight:
         self.state.sid_key = ()
         self.state.star_key = ()
         self.state.procedure_suspended = ""
+        self.state.comms_tuned = False
+        self.state.checked_in_with = ""
+        self.state.squawk_dialled = ""
+        self.state.altimeter_dialled = 0.0
+        self.state.last_radio_at = 0.0
+        self.state.service_started_at = 0.0
+        self.state.gsx_asked = False
+        self.state.gsx_busy = False
+        self.state.fuel_wrote = False
+        self.state.service_warned = False
+        self.state.alternate = None
+        self.state.mtow_warned = False
+        self.state.flap_gate_warned = False
+        self.state.minimum_fuel_said = False
+        self.state.depart_fuel_warned = False
         self._ga_flag_seen = False
         self._last_lever = 0.0
         self._ground_still_since = 0.0
+        self._checklist_item_id = 0
+        self._checklist_item_since = 0.0
+        self._dialled_at = 0.0
         if self._dir is not None:
             self._dir.reset()
         self._speeds = None

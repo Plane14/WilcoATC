@@ -266,6 +266,37 @@ class ChecklistRunner:
             return ""
         return run.item.challenge_in("en")
 
+    def pending(self):
+        """(item, run state) of what the checklist is on, for a flying FO.
+
+        The autonomous first officer does the item itself rather than wait
+        for a pilot who is not there: ``item`` is whose check it is (None
+        with no run), the state is ``queued``/``waiting``/``held`` --
+        queued is still being said, held is a checklist that stalled on an
+        objection or a silence and wants a "continue".
+        """
+        run = self._run
+        if run is None or run.index >= len(run.items):
+            return None, ""
+        return run.item, run.state
+
+    def fo_answer(self, value: float | None = None) -> bool:
+        """Answer the item as the first officer flying would.
+
+        The answer kinds are the item's own accept list, so the runner's
+        verification is exactly what a pilot's spoken answer gets: the
+        simulator is asked, a disagreement is objected to, and an item the
+        aeroplane cannot satisfy is left open -- never waved through.
+        ``value`` is the figure a ``$said`` check resolves, where one is
+        wanted. False when nothing is running.
+        """
+        run = self._run
+        if run is None or run.index >= len(run.items):
+            return False
+        self.hear(ip.Said(who=ip.FIRST_OFFICER, what=ip.ANSWER,
+                          answers=tuple(run.item.accept), value=value))
+        return True
+
     def drop(self) -> None:
         """Stop the checklist in hand without a word: the first officer, or
         the checklists, were switched off."""

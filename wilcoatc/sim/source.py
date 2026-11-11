@@ -225,6 +225,18 @@ def _text(raw) -> str:
     return str(raw).strip("\x00 ").strip()
 
 
+def _simvar_name(request_name: str) -> str:
+    """The SimConnect variable a request-table name stands for.
+
+    The request table's ``FUEL_TANK_CENTER_QUANTITY`` is the SDK's
+    ``FUEL TANK CENTER QUANTITY``: underscores in the name are spaces in
+    the variable. An ``:index`` tail is a real index, left as it is.
+    """
+    name, _, index = request_name.partition(":")
+    spaced = name.replace("_", " ")
+    return f"{spaced}:{index}" if index else spaced
+
+
 # --------------------------------------------------------------------------
 # SimConnect
 # --------------------------------------------------------------------------
@@ -422,6 +434,23 @@ class SimConnectSource:
         ("FUEL_LEFT_QUANTITY", "fuel_left_gal", "raw", "slow"),     # Gallons
         ("FUEL_RIGHT_QUANTITY", "fuel_right_gal", "raw", "slow"),   # Gallons
         ("FUEL_TOTAL_QUANTITY_WEIGHT", "fuel_total_lb", "raw", "slow"),  # lb
+        # What the tanks can hold and what of that cannot be used, for
+        # the turnaround's refuelling and the FO's reserve calculation.
+        # NEW FUEL SYSTEM distinguishes the 2024 [FUEL_SYSTEM] models --
+        # whose tank variables are model-named -- from the legacy [FUEL]
+        # ones, which these names still reach. UNVERIFIED on a running
+        # 2024 for models that publish neither.
+        ("FUEL_TOTAL_CAPACITY", "fuel_capacity_gal", "raw", "slow"),  # Gallons
+        ("UNUSABLE_FUEL_QUANTITY", "fuel_unusable_gal", "raw", "slow"),  # Gallons
+        ("NEW_FUEL_SYSTEM", "new_fuel_system", "bool", "slow"),
+        ("ESTIMATED_FUEL_FLOW", "est_fuel_flow_pph", "raw", "slow"),  # lb/h
+        ("AIRSPEED_MACH", "airspeed_mach", "raw", "slow"),
+        # Combustion per engine past the first, for the engine-out
+        # detection a single engines_running flag cannot do on a twin.
+        # The wrapper's indexed lookup handles the :2/:3/:4 slide.
+        ("GENERAL_ENG_COMBUSTION:2", "eng2_combustion", "bool", "slow"),
+        ("GENERAL_ENG_COMBUSTION:3", "eng3_combustion", "bool", "slow"),
+        ("GENERAL_ENG_COMBUSTION:4", "eng4_combustion", "bool", "slow"),
         # The helicopter's own instruments (MSFS 2024 Helicopter
         # Variables). Slow like the rest of the configuration: the
         # autonomous rotorcraft controller reads them on demand
@@ -493,6 +522,12 @@ class SimConnectSource:
         # remembered as unwritable rather than asked for again every tick.
         self._writers: dict[str, object] = {}
         self._unwritable: set[str] = set()
+        # Replies to RequestSystemState, keyed by request ID, parked here by
+        # the wrapped state handler until somebody asks for them. The reply
+        # arrives on the wrapper's dispatch thread, so both sides take this
+        # little lock.
+        self._system_state: dict[int, str] = {}
+        self._system_state_lock = threading.Lock()
 
     @property
     def connected(self) -> bool:
@@ -546,6 +581,7 @@ class SimConnectSource:
             serialize(self._sim.dll)
             self._requests = AircraftRequests(self._sim, _time=self.request_timeout_ms)
             self.define_our_variables(self._requests)
+            self._capture_system_state(self._sim)
             self._connected = True
             # A reconnection is to a different simulator session: the event
             # handles from the last one are stale, and a variable that was
@@ -602,6 +638,28 @@ class SimConnectSource:
         "ROTOR_GOV_TARGET_PCT:index": [
             "The governor's target RPM, per cent of nominal",
             b"ROTOR GOV TARGET PCT:index", b"Percent", "N"],
+        # Fuel beyond the legacy [FUEL]-section names: what of the
+        # capacity can never be burned, whether the model is a 2024
+        # [FUEL_SYSTEM] one, and the fuel-system tank variables the
+        # turnaround refuels through on those. The tank index is a
+        # position in the model's fuel system, not a named legacy tank.
+        # UNVERIFIED on a running 2024: whether QUANTITY is writable per
+        # tank is up to the model.
+        "UNUSABLE_FUEL_QUANTITY": [
+            "The fuel that can never be drawn",
+            b"UNUSABLE FUEL QUANTITY", b"Gallons", "N"],
+        "NEW_FUEL_SYSTEM": [
+            "Whether the model uses the [FUEL_SYSTEM] section",
+            b"NEW FUEL SYSTEM", b"Bool", "N"],
+        "FUELSYSTEM_TANK_QUANTITY:index": [
+            "Fuel in one fuel-system tank",
+            b"FUELSYSTEM TANK QUANTITY:index", b"Gallons", "Y"],
+        "FUELSYSTEM_TANK_CAPACITY:index": [
+            "Capacity of one fuel-system tank",
+            b"FUELSYSTEM TANK CAPACITY:index", b"Gallons", "N"],
+        "FUELSYSTEM_TANK_COUNT": [
+            "How many fuel-system tanks the model has",
+            b"FUELSYSTEM TANK COUNT", b"Number", "N"],
     }
 
     @classmethod
@@ -1081,13 +1139,16 @@ class SimConnectSource:
             return False
         return self._send(b"XPNDR_SET", packed)
 
-    def set_variable(self, name: str, value: float) -> bool:
+    def set_variable(self, name: str, value: float,
+                     unit: str = "Number") -> bool:
         """Write a simulation variable on the user's aircraft.
 
         For what no event reaches: the throttle lever's position, a fuel
         selector, a trim. Each name gets one data definition, made on first
         use; a name the simulator refuses is remembered in ``_unwritable``
         so the caller's fallback is tried instead of asking every tick.
+        ``unit`` is what the value is in -- the definition is the write's
+        unit too, so gallons ask for "Gallons", not a bare "Number".
         Returns False when there is no answer, which is never an error --
         the First Officer flies by events where this cannot write.
         """
@@ -1099,7 +1160,7 @@ class SimConnectSource:
             return False
         writer = self._writers.get(name)
         if writer is None:
-            writer = Request((name.encode(), b"Number"), self._sim,
+            writer = Request((name.encode(), unit.encode()), self._sim,
                              _dec=name, _settable=True)
             self._writers[name] = writer
         try:
@@ -1118,12 +1179,210 @@ class SimConnectSource:
             self._writers.pop(name, None)
             return False
 
+    # ------------------------------------------------------------------
+    # the plan the simulator itself is flying
+    # ------------------------------------------------------------------
+
+    # The request ID "FlightPlan" answers are asked for under. Any value no
+    # other request uses would do; this one is the word's own letters.
+    _FLIGHT_PLAN_REQUEST_ID = 0x464C4E          # "FLN"
+
+    def _capture_system_state(self, sim) -> None:
+        """Keep system-state replies instead of printing them.
+
+        The wrapper routes ``SIMCONNECT_RECV_ID_SYSTEM_STATE`` to
+        ``handle_state_event``, which it writes as a demonstration
+        (``print``) and forgets. The reply to a ``RequestSystemState``
+        call is the only way to learn the loaded plan's path, so the
+        handler is wrapped on this session and the string kept by request
+        ID until :meth:`loaded_flight_plan` comes back for it.
+        """
+        original = getattr(sim, "handle_state_event", None)
+        if original is None or getattr(original, "_wilco_captured", False):
+            return
+        keep = self._system_state
+        lock = self._system_state_lock
+
+        def capture(state):
+            try:
+                text = bytes(state.szString).split(b"\x00", 1)[0].decode(
+                    "utf-8", errors="replace")
+                with lock:
+                    keep[int(state.dwRequestID)] = text
+            except Exception:
+                pass
+            return original(state)
+
+        capture._wilco_captured = True
+        sim.handle_state_event = capture
+
+    # How long to wait for the FlightPlan reply. It normally comes back on
+    # the next frame's dispatch, but a first request on a session can take
+    # a moment; two seconds is long enough to have an answer without making
+    # the situation loop noticeably late.
+    _SYSTEM_STATE_WAIT_S = 2.0
+
+    def loaded_flight_plan(self) -> str | None:
+        """The path of the flight plan the simulator has loaded, or "".
+
+        ``RequestSystemState("FlightPlan")`` is the documented way to ask:
+        the reply's ``szString`` carries the full path of the active .pln,
+        which is "" when none is loaded. The reply is asynchronous -- it
+        arrives on the wrapper's dispatch thread -- so this waits briefly
+        for it, and returns None rather than an empty path when the
+        simulator never answered (an old SimConnect, a blocked session).
+        "" and None are deliberately different: "" is "no plan", None is
+        "no answer".
+        """
+        sim = self._sim
+        if not self._connected or sim is None:
+            return None
+        request_id = self._FLIGHT_PLAN_REQUEST_ID
+        with self._system_state_lock:
+            self._system_state.pop(request_id, None)
+        try:
+            hr = sim.dll.RequestSystemState(
+                sim.hSimConnect, request_id, b"FlightPlan")
+        except Exception:
+            log.debug("RequestSystemState failed", exc_info=True)
+            return None
+        if not sim.IsHR(hr, 0):
+            return None
+        deadline = time.monotonic() + self._SYSTEM_STATE_WAIT_S
+        while time.monotonic() < deadline:
+            with self._system_state_lock:
+                found = self._system_state.pop(request_id, None)
+            if found is not None:
+                return found
+            if not self._connected:
+                return None
+            time.sleep(0.05)
+        return None
+
+    def request_flight_plan(self) -> bool:
+        """Ask for the active plan's path without waiting for the answer.
+
+        The non-blocking half of :meth:`loaded_flight_plan`, for callers on
+        a loop that cannot hold for the reply: this issues the request and
+        :meth:`flight_plan_reply` picks the answer up when the wrapper's
+        dispatch thread has brought it in.
+        """
+        sim = self._sim
+        if not self._connected or sim is None:
+            return False
+        try:
+            hr = sim.dll.RequestSystemState(
+                sim.hSimConnect, self._FLIGHT_PLAN_REQUEST_ID, b"FlightPlan")
+        except Exception:
+            log.debug("RequestSystemState failed", exc_info=True)
+            return False
+        return bool(sim.IsHR(hr, 0))
+
+    def flight_plan_reply(self) -> str | None:
+        """The newest captured ``FlightPlan`` reply, once.
+
+        "" is a real answer -- the simulator has no active plan; None is
+        no answer yet (or one already taken). The reply stays available
+        until asked for, so a caller polling at its own rate cannot miss
+        one that arrived between its ticks.
+        """
+        with self._system_state_lock:
+            return self._system_state.pop(self._FLIGHT_PLAN_REQUEST_ID, None)
+
+    # ------------------------------------------------------------------
+    # fuel
+    # ------------------------------------------------------------------
+
+    # The legacy [FUEL]-section tanks, paired (capacity, quantity), in the
+    # order a real fueller would service them: centre first, then the
+    # mains, then the auxiliaries. Capacities and quantities are in the
+    # wrapper's own request table, so they read through ``_get`` by name.
+    _LEGACY_TANKS: tuple[tuple[str, str], ...] = (
+        ("FUEL_TANK_CENTER_CAPACITY", "FUEL_TANK_CENTER_QUANTITY"),
+        ("FUEL_TANK_LEFT_MAIN_CAPACITY", "FUEL_TANK_LEFT_MAIN_QUANTITY"),
+        ("FUEL_TANK_RIGHT_MAIN_CAPACITY", "FUEL_TANK_RIGHT_MAIN_QUANTITY"),
+        ("FUEL_TANK_CENTER2_CAPACITY", "FUEL_TANK_CENTER2_QUANTITY"),
+        ("FUEL_TANK_CENTER3_CAPACITY", "FUEL_TANK_CENTER3_QUANTITY"),
+        ("FUEL_TANK_LEFT_AUX_CAPACITY", "FUEL_TANK_LEFT_AUX_QUANTITY"),
+        ("FUEL_TANK_RIGHT_AUX_CAPACITY", "FUEL_TANK_RIGHT_AUX_QUANTITY"),
+        ("FUEL_TANK_LEFT_TIP_CAPACITY", "FUEL_TANK_LEFT_TIP_QUANTITY"),
+        ("FUEL_TANK_RIGHT_TIP_CAPACITY", "FUEL_TANK_RIGHT_TIP_QUANTITY"),
+        ("FUEL_TANK_EXTERNAL1_CAPACITY", "FUEL_TANK_EXTERNAL1_QUANTITY"),
+        ("FUEL_TANK_EXTERNAL2_CAPACITY", "FUEL_TANK_EXTERNAL2_QUANTITY"),
+    )
+
+    def fuel_tanks(self) -> list[tuple[str, float, float]]:
+        """(variable name, capacity, quantity) per tank, in gallons.
+
+        Which names is the model's: a 2024 [FUEL_SYSTEM] aircraft has its
+        tanks under ``FUELSYSTEM TANK <index>``, a legacy one under
+        ``FUEL TANK <name>``. Capacity may come back 0 on a model that
+        reports the quantity alone; the tank still counts, because a
+        capacity of 0 is a model that does not publish it, not a tank
+        that holds nothing.
+        """
+        if not self._connected:
+            return []
+        tanks: list[tuple[str, float, float]] = []
+        if bool(self._values.get("new_fuel_system")):
+            count = self._get("FUELSYSTEM_TANK_COUNT") or 0
+            for index in range(1, max(1, int(count)) + 1):
+                cap = self._get(f"FUELSYSTEM_TANK_CAPACITY:{index}")
+                qty = self._get(f"FUELSYSTEM_TANK_QUANTITY:{index}")
+                if cap is None and qty is None:
+                    continue
+                tanks.append((f"FUELSYSTEM TANK QUANTITY:{index}",
+                              float(cap or 0.0), float(qty or 0.0)))
+            if tanks:
+                return tanks
+        for cap_name, qty_name in self._LEGACY_TANKS:
+            cap = self._get(cap_name)
+            qty = self._get(qty_name)
+            if cap is None and qty is None:
+                continue
+            tanks.append((_simvar_name(qty_name),
+                          float(cap or 0.0), float(qty or 0.0)))
+        return tanks
+
+    def set_fuel(self, gallons: float) -> bool:
+        """Put *gallons* of fuel aboard, spread over the tanks it has.
+
+        The turnaround's fallback where GSX cannot be asked: each tank is
+        written in its own scheme (``FUELSYSTEM TANK`` on a [FUEL_SYSTEM]
+        model, ``FUEL TANK`` on a legacy one), centre tanks first as a
+        fueller would, and never past a capacity the model declares. A
+        write that the simulator refuses is answered False, not retried --
+        the caller falls back to asking GSX.
+        """
+        if not self._connected:
+            return False
+        tanks = self.fuel_tanks()
+        if not tanks:
+            # A model that publishes no tanks may still take the total.
+            return self.set_variable("FUEL TOTAL QUANTITY", float(gallons),
+                                     unit="Gallons")
+        remaining = max(0.0, float(gallons))
+        total_cap = sum(cap for _n, cap, _q in tanks)
+        if total_cap > 0.0:
+            remaining = min(remaining, total_cap)
+        wrote = False
+        for name, cap, _qty in tanks:
+            if remaining <= 0.0:
+                break
+            fill = min(remaining, cap) if cap > 0.0 else remaining
+            if self.set_variable(name, fill, unit="Gallons"):
+                remaining -= fill
+                wrote = True
+        return wrote
+
     def close(self) -> None:
         self._connected = False
         self._events.clear()
         self._freq_event_style.clear()
         self._writers.clear()
         self._unwritable.clear()
+        with self._system_state_lock:
+            self._system_state.clear()
         if self._sim is not None:
             try:
                 self._sim.exit()
@@ -1230,6 +1489,35 @@ class ManualSource:
         controller working without one still finishes its sentence."""
         return False
 
+    # The same fuel and plan surface the simulator has, so the autonomous
+    # controller works unchanged on a scripted aeroplane.
+
+    def loaded_flight_plan(self) -> str | None:
+        """No simulator, so no plan it could be holding. None, not ""."""
+        return None
+
+    def request_flight_plan(self) -> bool:
+        """Nothing to ask; there is no simulator to hold a plan."""
+        return False
+
+    def flight_plan_reply(self) -> str | None:
+        return None
+
+    def fuel_tanks(self) -> list:
+        return []
+
+    def set_fuel(self, gallons: float) -> bool:
+        """Refuel the aeroplane the scripted state is flying."""
+        try:
+            value = max(0.0, float(gallons))
+            if self._state.fuel_capacity_gal > 0:
+                value = min(value, self._state.fuel_capacity_gal)
+            self._state.fuel_total_gal = value
+            self._state.fuel_total_lb = value * 6.0
+            return True
+        except Exception:
+            return False
+
     def close(self) -> None:
         return None
 
@@ -1273,6 +1561,23 @@ class ReplaySource:
             self._index = 0
         self._state.timestamp = time.monotonic()
         return replace(self._state)
+
+    # The fuel and plan calls a real source answers; a replay is what it
+    # is, so these are polite no-ops rather than missing methods.
+    def loaded_flight_plan(self) -> str | None:
+        return None
+
+    def request_flight_plan(self) -> bool:
+        return False
+
+    def flight_plan_reply(self) -> str | None:
+        return None
+
+    def fuel_tanks(self) -> list:
+        return []
+
+    def set_fuel(self, gallons: float) -> bool:
+        return False
 
     def close(self) -> None:
         return None

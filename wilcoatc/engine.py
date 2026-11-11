@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -615,6 +616,16 @@ class Engine:
         # loop reads COM1 back a moment later and must not treat its own
         # write as the pilot having reached for the radio.
         self._tuned_by_us = 0.0
+        # The simulator's own loaded flight plan, polled for (the
+        # FlightPlanActivated event does not reach this wrapper, and on
+        # 2024 it is not to be believed when it does). A request is in the
+        # air until its reply is taken; the file's path+mtime dedupe the
+        # loads, so an unchanged plan is never reparsed.
+        self._sim_plan_requested = False
+        self._sim_plan_at = 0.0
+        self._sim_plan_seen = ""
+        self._sim_plan_path = ""
+        self._sim_plan_mtime = 0.0
         # The language of the last exchange, so an ATIS or a volunteered
         # handoff continues in whatever the pilot has been speaking.
         self.last_language = self.languages[0]
@@ -736,6 +747,17 @@ class Engine:
         if pending is not None and not pending.read_back:
             return "", "readback"
         phase = session.phase
+        if kind == "check_in":
+            vs = getattr(self.state, "vertical_speed_fpm", 0.0) or 0.0
+            alt = session.assigned_altitude_ft \
+                or getattr(self.state, "altitude_ft", 0.0) or 0.0
+            if abs(vs) < 300.0:
+                return speech.maintaining(aircraft, name, alt), ""
+            return speech.checking_in(aircraft, name, alt,
+                                      climbing=vs > 0), ""
+        if kind == "going_around":
+            return speech.going_around(
+                aircraft, session.assigned_altitude_ft or 0.0), ""
         if kind == "any":
             if phase in (Phase.PREFLIGHT, Phase.CLEARED) and session.ifr \
                     and not session.clearance_issued:
@@ -1932,6 +1954,73 @@ class Engine:
                      cross_track_nm=round(found.cross_track_nm, 1),
                      to_go_nm=round(found.to_go_nm, 1),
                      altitude_ft=round(state.altitude_ft))
+
+    # ------------------------------------------------------------------
+    # the plan the simulator itself is flying
+    # ------------------------------------------------------------------
+
+    _SIM_PLAN_POLL_S = 10.0
+
+    def _poll_sim_plan(self) -> None:
+        """Ask the simulator which flight plan it has loaded, and take it.
+
+        ``RequestSystemState("FlightPlan")`` is answered on the wrapper's
+        dispatch thread, so the ask and the answer are split over two
+        passes of this loop -- the loop never waits on the reply.
+        """
+        if not getattr(self.config.immersion, "autonomous_read_sim_plan",
+                       True):
+            return
+        source = self.source
+        ask = getattr(source, "request_flight_plan", None)
+        take = getattr(source, "flight_plan_reply", None)
+        if ask is None or take is None \
+                or not getattr(source, "connected", False):
+            return
+        now = time.monotonic()
+        if self._sim_plan_requested:
+            reply = take()
+            if reply is not None:
+                self._sim_plan_requested = False
+                self._sim_plan_seen = reply
+            elif now - self._sim_plan_at > self._SIM_PLAN_POLL_S:
+                self._sim_plan_requested = False    # the answer never came
+            else:
+                return
+        if not self._sim_plan_requested \
+                and now - self._sim_plan_at >= self._SIM_PLAN_POLL_S:
+            self._sim_plan_at = now
+            self._sim_plan_requested = bool(ask())
+        # Adopted on the ground only: a plan the sim swapped to
+        # mid-flight is picked up after the landing, not flown from under
+        # the leg already being flown.
+        if self._sim_plan_seen and getattr(self.state, "on_ground", True):
+            self._use_sim_plan(self._sim_plan_seen)
+
+    def _use_sim_plan(self, path: str) -> None:
+        """The simulator's active .pln as the flight's route.
+
+        Loaded once per file: the same path at the same modified time is
+        the same plan, and never reparsed. A route the pilot loaded by
+        hand is only replaced when the simulator's plan itself changes --
+        which is exactly the moment the sim's plan is the newer one.
+        """
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if path == self._sim_plan_path and mtime == self._sim_plan_mtime:
+            return
+        try:
+            described = self.load_route_file(path)
+        except Exception as exc:
+            log.info("simulator flight plan %s could not be loaded: %s",
+                     path, exc)
+            return
+        self._sim_plan_path = path
+        self._sim_plan_mtime = mtime
+        self.emit("info", f"Flight plan from the simulator: {described}",
+                  key="log.simplan")
 
     # ------------------------------------------------------------------
     # the language follows the aeroplane
@@ -3515,6 +3604,9 @@ class Engine:
         # surface watch does not take a bounce for a takeoff.
         self._note_rollout_liftoff(previous, state, session)
         self._follow_route(state)
+        # And the simulator's own loaded plan, which is the route when the
+        # setting asks for it and nothing newer has replaced it.
+        self._poll_sim_plan()
 
         # What the aircraft is doing is checked before the phase is updated,
         # because a departure and a touchdown are transitions: updating first

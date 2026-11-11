@@ -681,6 +681,11 @@ class RotorcraftFlight:
 
         # -- cyclic longitudinal: airspeed ----------------------------------
         if ias_target is not None and airborne:
+            # Nothing is chased past the type's never-exceed: the target
+            # itself is held under it, not merely the overspeed pulled
+            # back from.
+            ias_target = min(float(ias_target),
+                             self._profile.max_ias_kt * 0.95)
             err = ias_target - ias
             axis = CYCLIC_TRIM_AIRBORNE + CYCLIC_KT_PER_AXIS * err
             # A helicopter cannot climb vertically forever: bleed speed

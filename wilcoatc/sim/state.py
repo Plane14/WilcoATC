@@ -148,6 +148,24 @@ class AircraftState:
     fuel_left_gal: float = 0.0
     fuel_right_gal: float = 0.0
     fuel_total_lb: float = 0.0
+    # What the tanks hold and what cannot be used, in gallons, and whether
+    # the model runs the new [FUEL_SYSTEM] section or the legacy [FUEL]
+    # one -- the difference between which SimVars carry the fuel.
+    fuel_capacity_gal: float = 0.0
+    fuel_unusable_gal: float = 0.0
+    new_fuel_system: bool = False
+    # ESTIMATED FUEL FLOW in pounds an hour, the model's own figure for
+    # what cruise burns, where it declares one.
+    est_fuel_flow_pph: float = 0.0
+    # AIRSPEED MACH -- the number the high-altitude overspeed watch needs,
+    # which knots alone cannot give.
+    airspeed_mach: float = 0.0
+    # Combustion per engine, for engines two through four (engine one's is
+    # engines_running). None where the model does not publish them, so a
+    # multi that reports nothing is not treated as having failed.
+    eng2_combustion: bool | None = None
+    eng3_combustion: bool | None = None
+    eng4_combustion: bool | None = None
     # What a helicopter's instruments say (MSFS 2024 "Helicopter
     # Variables"): the collective lever, per cent depressed; the main
     # rotor's per cent of rated RPM; how many main rotors the model has;

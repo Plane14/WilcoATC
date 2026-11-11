@@ -1642,6 +1642,23 @@ class ImmersionConfig:
     # Whether to automatically request IFR clearance when available in
     # autonomous mode. When False, only VFR or flight-following is used.
     autonomous_request_ifr: bool = True
+    # Whether the First Officer works the radios itself while flying:
+    # the frequency changes, the readbacks, the check-ins on each new
+    # position. On by default -- there is nobody else aboard to do it.
+    autonomous_manage_comms: bool = True
+    # Read the flight plan the simulator itself has loaded and fly it,
+    # rather than only plans uploaded through the panel. Read on the
+    # ground only: a plan loaded mid-flight never rewrites a leg the FO
+    # is already flying.
+    autonomous_read_sim_plan: bool = True
+    # Refuel and reset the aircraft between chained flights, the way a
+    # turnaround is actually serviced: engines off, GSX's truck where the
+    # stand can ask for one, the tanks written where it cannot.
+    autonomous_service_turnaround: bool = True
+    # The fuel reserve every leg is planned against: minutes of cruise
+    # fuel held for the missed approach, the flight to the alternate and
+    # the hold there, on top of trip fuel -- as dispatch requires.
+    autonomous_divert_reserve_min: float = 45.0
     # Whether to use the simulator's AI pilot (AI Control) for parts of the
     # flight the First Officer doesn't explicitly manage. Off by default
     # because it conflicts with explicit autopilot control.
@@ -1722,6 +1739,15 @@ describe(
                                      **_AUTONOMOUS),
     autonomous_request_ifr=Setting(label="set.autonomous_request_ifr",
                                    help="set.autonomous_request_ifr_why", **_AUTONOMOUS),
+    autonomous_manage_comms=Setting(label="set.autonomous_comms",
+                                    help="set.autonomous_comms_why", **_AUTONOMOUS),
+    autonomous_read_sim_plan=Setting(label="set.autonomous_sim_plan",
+                                     help="set.autonomous_sim_plan_why", **_AUTONOMOUS),
+    autonomous_service_turnaround=Setting(label="set.autonomous_service",
+                                          help="set.autonomous_service_why", **_AUTONOMOUS),
+    autonomous_divert_reserve_min=Setting(min=15, max=120, step=5, unit="min",
+                                          label="set.autonomous_reserve",
+                                          help="set.autonomous_reserve_why", **_AUTONOMOUS),
     autonomous_use_sim_ai=Setting(label="set.autonomous_use_sim_ai",
                                   help="set.autonomous_use_sim_ai_why", **_AUTONOMOUS),
 )
