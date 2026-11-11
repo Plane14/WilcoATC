@@ -53,9 +53,13 @@ COLLECTIVE_SET = b"AXIS_COLLECTIVE_SET"
 CYCLIC_LONG_SET = b"AXIS_CYCLIC_LONGITUDINAL_SET"
 CYCLIC_LAT_SET = b"AXIS_CYCLIC_LATERAL_SET"
 STEERING_SET = b"AXIS_STEERING_SET"
-# The pedals are anti-torque, not nosewheel: ``AXIS_TAIL_ROTOR_SET`` is
-# the helicopter's yaw channel; the steering axis only matters to the
-# models that ground-taxi on wheels and is sent alongside.
+# The pedals are anti-torque, not nosewheel: ``ROTOR_AXIS_TAIL_ROTOR_SET``
+# is the helicopter's yaw channel on the SDK's signed axis scale. The
+# 2024 reference also lists ``AXIS_TAIL_ROTOR_SET`` -- a tail-rotor
+# *speed* command on a 0..16384 range, which cannot carry a left-pedal
+# input -- so it is the fallback only, never the first ask; the steering
+# axis only matters to the models that ground-taxi on wheels.
+PEDAL_SET = b"ROTOR_AXIS_TAIL_ROTOR_SET"
 TAIL_ROTOR_SET = b"AXIS_TAIL_ROTOR_SET"
 HELI_THROTTLE_SET = b"AXIS_HELICOPTER_THROTTLE_SET"
 # Named throttle events as fallbacks, per the same page: "set all
@@ -329,6 +333,7 @@ class RotorcraftFlight:
         try:
             self._send(CYCLIC_LONG_SET, 0)
             self._send(CYCLIC_LAT_SET, 0)
+            self._send(PEDAL_SET, 0)
             self._send(TAIL_ROTOR_SET, 0)
             self._send(STEERING_SET, 0)
         except Exception:
@@ -582,6 +587,7 @@ class RotorcraftFlight:
             self._collective(5.0)
             self._send(CYCLIC_LONG_SET, CYCLIC_TRIM_HOVER)
             self._send(CYCLIC_LAT_SET, 0)
+            self._send(PEDAL_SET, 0)
             self._send(TAIL_ROTOR_SET, 0)
             self._send(STEERING_SET, 0)
             self._send(b"PARKING_BRAKE_SET", 1)
@@ -658,10 +664,13 @@ class RotorcraftFlight:
 
         # -- collective: height, or rate of climb --------------------------
         if agl_target is not None:
-            # Hover/landing: feet above the ground, with sink damping.
+            # Hover/landing: feet above the ground, damped towards the
+            # wanted vertical speed rather than towards none -- a landing
+            # asks for three hundred feet a minute down, and holding the
+            # hover asks for zero.
             err = agl_target - agl
             coll = self.state.coll_trim + COLL_KP_PER_FT * err \
-                - COLL_KD_PER_FPM * vs
+                + COLL_KD_PER_FPM * ((vs_target or 0.0) - vs)
             # Learn the trim only in a steady hover, so a climb does not
             # teach the collective the wrong number.
             if airborne and abs(vs) < 150.0 and abs(err) < 40.0:
@@ -670,9 +679,13 @@ class RotorcraftFlight:
                     - self.state.coll_trim) * 0.1
         elif alt_target is not None:
             # Cruise/climb/descent: feet to the level, rate of climb damped.
+            # The caller's target vertical speed bounds the ask where it
+            # gives one -- a climb at eight hundred feet a minute is not
+            # the envelope's twelve hundred.
             err = alt_target - alt
-            want_vs = _clamp(err * 2.0, -self._profile.max_vs_fpm,
-                             self._profile.max_vs_fpm)
+            limit = (min(self._profile.max_vs_fpm, abs(vs_target))
+                     if vs_target else self._profile.max_vs_fpm)
+            want_vs = _clamp(err * 2.0, -limit, limit)
             coll = self.state.coll_trim + COLL_KP_PER_FT * err / 10.0 \
                 + COLL_KD_PER_FPM * (want_vs - vs) / 10.0
         else:
@@ -705,7 +718,8 @@ class RotorcraftFlight:
             err = _heading_error(want_hdg, hdg)
             pedal = int(_clamp(-PEDAL_DEG_PER_AXIS * err, -PEDAL_MAX,
                                PEDAL_MAX))
-            self._send(TAIL_ROTOR_SET, pedal)
+            if not self._send(PEDAL_SET, pedal):
+                self._send(TAIL_ROTOR_SET, pedal)
             self._send(STEERING_SET, pedal)
 
         # -- throttle ---------------------------------------------------------
@@ -780,9 +794,16 @@ class RotorcraftFlight:
         return state.distance_to(self.state.dest_lat, self.state.dest_lon)
 
     def _desired_track(self, state) -> float:
-        """Where to point: the controller's heading, else the destination."""
+        """Where to point, in degrees true: the controller's heading, else
+        the destination. An assigned heading is spoken magnetic, and the
+        pedal loop steers ``heading_true`` -- without the conversion the
+        pedals hold a heading off by the local variation."""
         assigned = getattr(self.session, "assigned_heading", None)
         if assigned:
+            if getattr(state, "has_position", False):
+                from ..navdata.magvar import to_true, variation
+                return to_true(float(assigned),
+                               variation(state.latitude, state.longitude))
             return float(assigned)
         if not getattr(state, "has_position", False) \
                 or not self.state.dest_lat:

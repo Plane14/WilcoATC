@@ -1210,7 +1210,8 @@ class AutonomousFlight:
             "autopilot": lambda: d.autopilot(want_on),
             "autothrottle": lambda: (d.autothrottle_arm() if want_on
                                      else d.autothrottle_disconnect()),
-            "gps_drives_nav1": lambda: d.nav_source(1 if want_on else 0),
+            "gps_drives_nav1": lambda: d.write("GPS DRIVES NAV1",
+                                               1.0 if want_on else 0.0),
             "fuel_selector": lambda: d.write("FUEL TANK SELECTOR:1",
                                              float(expected)),
             "mixture_pct": lambda: d.write("GENERAL ENG MIXTURE LEVER "
@@ -1333,7 +1334,10 @@ class AutonomousFlight:
                 d.kohlsman(float(self.session.altimeter))
             d.beacon(True)
             d.nav_lights(True)
-            d.seatbelts(True)
+            # The seatbelt event is a toggle, not a set: asking for "on"
+            # where it is already on would switch it off.
+            if not getattr(state, "seatbelt_sign", False):
+                d.seatbelts(True)
             d.parking_brake(True)
             self._goto_sub("checklist")
 
@@ -1745,7 +1749,10 @@ class AutonomousFlight:
             self.director.nav(True)
             self.director.airspeed_hold(True)
             target = self._altitude_target(state)
-            self.director.altitude(target)
+            # No assigned or planned level is not an instruction to find
+            # the sea: a zero on the altitude bug is a descent to it.
+            if target:
+                self.director.altitude(target)
             self.director.alt_hold(True)
             self._manage_throttle(state, self._speed_target(state))
             self.director.speed(self._speed_target(state))
@@ -1861,7 +1868,9 @@ class AutonomousFlight:
                     agl = state.altitude_agl_ft or 0.0
                     vs = -600.0 if agl > 400.0 else -250.0
                     self._apply_flight_director(
-                        state, vs_fpm=vs, heading=self.state.runway_heading,
+                        state, vs_fpm=vs,
+                        heading=self._magnetic(self.state.runway_heading,
+                                               state),
                         speed_kt=self.state.vapp_kt
                         or self.performance.approach_kt)
 
@@ -2875,7 +2884,10 @@ class AutonomousFlight:
 
         # Gear down on final, flaps through the stages, speedbrake armed.
         if agl < 2000 or (distance is not None and distance < 10.0):
-            if state.gear_down is not False:
+            # Only a model that has said the gear is down already is not
+            # asked: up or unanswered both get the command. The inverted
+            # check used to ask only the aeroplane already configured.
+            if state.gear_down is not True:
                 d.gear(True)
         if distance is not None and distance < 6.0 and agl < 2500:
             self._set_flaps(state, 0.75)
@@ -3014,7 +3026,12 @@ class AutonomousFlight:
             if state.gear_down:
                 d.gear(False)
         # Wings-level climb on the runway heading or the assigned heading.
-        hdg = self.session.assigned_heading or self.state.runway_heading
+        # The heading bug is magnetic: the runway's is degrees true off
+        # the threshold's coordinates, so it is converted like every
+        # other course this hands the autopilot.
+        hdg = self.session.assigned_heading
+        if not hdg and self.state.runway_heading > 0:
+            hdg = self._magnetic(self.state.runway_heading, state)
         if hdg > 0:
             self._apply_flight_director(state, altitude=self.state.missed_alt_ft,
                                         vs_fpm=self.performance.climb_fpm,
@@ -3118,9 +3135,50 @@ class AutonomousFlight:
 
     # -- fuel planning -------------------------------------------------------
 
-    def _lb_per_gal(self) -> float:
-        """The fuel's weight per gallon: Jet-A on a turbine, avgas else."""
-        return 6.7 if self._is_turbine(None) else 6.0
+    def _is_turbine(self, state) -> bool:
+        """Whether the aeroplane burns Jet-A: a jet, a turboprop or a
+        turbine helicopter does; a piston -- including a piston
+        helicopter -- does not.
+
+        The simulator's ``ENGINE TYPE`` is decisive where it has
+        answered; the type's Doc 8643 description answers where it has
+        not; the class the session began with is the fallback, and the
+        commonest class (a piston single) is what it falls back to.
+        """
+        from . import aircraft_class as ac
+
+        # ``ENGINE TYPE`` is -1 until the sim answers; 0 is a real answer
+        # -- a piston -- and must not be folded into "unknown".
+        raw = getattr(state, "engine_type", -1) if state is not None else -1
+        kind = -1 if raw is None else int(raw)
+        if kind in (ac.SIM_JET, ac.SIM_HELO_TURBINE, ac.SIM_TURBOPROP):
+            return True
+        if kind == ac.SIM_PISTON:
+            return False
+        # The designator's power letter: 'J' and 'T' are Jet-A, 'P' is
+        # avgas -- which is also what an H1P helicopter burns.
+        code = (getattr(getattr(self.session, "aircraft", None),
+                        "type_code", "") or "").strip().upper()
+        description = ac.DOC_8643.get(code)
+        if description:
+            return description[-1] in ("T", "J")
+        if self._is_helicopter:
+            # The helicopter rows the table does not know are the turbine
+            # ones almost everywhere; the pistons are listed above.
+            return True
+        name = getattr(self, "_aircraft_class", "")
+        if not name:
+            name = ac.classify(code).name
+        return name not in (ac.PISTON_SINGLE, ac.PISTON_TWIN)
+
+    def _lb_per_gal(self, state=None) -> float:
+        """The fuel's weight per gallon: what the tanks themselves say,
+        else Jet-A on a turbine and avgas else."""
+        gal = float(getattr(state, "fuel_total_gal", 0.0) or 0.0)
+        lb = float(getattr(state, "fuel_total_lb", 0.0) or 0.0)
+        if gal > 0.5 and lb > 0.0:
+            return lb / gal
+        return 6.7 if self._is_turbine(state) else 6.0
 
     def _fuel_flow_pph(self, state, estimate: bool = False) -> float:
         """Pounds an hour the type burns in cruise, or 0 where unknown.
@@ -3134,7 +3192,11 @@ class AutonomousFlight:
         flow = float(getattr(state, "est_fuel_flow_pph", 0.0) or 0.0)
         if flow > 0.0 or not estimate:
             return flow
-        kind = int(getattr(state, "engine_type", -1) or -1)
+        # 0 is a real answer -- a piston, eighty pounds an hour -- and
+        # ``or -1`` used to fold it into "unknown", which is the airliner
+        # figure: a Cessna held short for more fuel than its tanks hold.
+        raw = getattr(state, "engine_type", -1)
+        kind = -1 if raw is None else int(raw)
         if self._is_helicopter or kind == 3:
             return 300.0
         return {0: 80.0, 1: 4500.0, 5: 900.0}.get(kind, 1200.0)
@@ -3188,7 +3250,7 @@ class AutonomousFlight:
         if alt is not None:
             divert_hr = max(15.0, haversine_nm(
                 dest.lat, dest.lon, alt.lat, alt.lon)) / speed
-        per_gal = self._lb_per_gal()
+        per_gal = self._lb_per_gal(state)
         leg_gal = leg_hr * flow / per_gal
         divert_gal = divert_hr * flow / per_gal
         reserve_gal = self._reserve_hours() * flow / per_gal
@@ -3595,11 +3657,6 @@ class AutonomousFlight:
         self.session.destination = dest
         self.state.weather_gas = 0
         self._route_diversion()
-        code = (self.state.aircraft_type or "").upper()
-        return code[:1] in ("A", "B", "C", "D", "E", "F", "G", "H", "L") \
-            and code not in ("C152", "C172", "C182", "C208", "C25A", "PA28",
-                             "PA34", "DA40", "DA42", "SR22", "BE36", "TB20",
-                             "P28A", "AT3")
 
     # -- chain flights (unchanged behaviour) -----------------------------------
 
@@ -4017,7 +4074,8 @@ class AutonomousFlight:
             # says the AT is not already live.
             if not getattr(state, "autothrottle", False):
                 d.autothrottle_arm()
-            d.altitude(target)
+            if target:
+                d.altitude(target)
             d.level_change(True)
             self._manage_throttle(state, speed)
         else:
