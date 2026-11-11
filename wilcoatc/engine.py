@@ -3539,7 +3539,8 @@ class Engine:
         self._watch_transmission()
 
         previous = self.state
-        state = self.refresh_state()
+        with timed("tick.read", warn_over_ms=500):
+            state = self.refresh_state()
         session = self.session
         if session is None:
             return
@@ -3589,9 +3590,10 @@ class Engine:
 
         # The airport under the aeroplane decides what is on the radio there,
         # and the simulator is the authority on that.
-        self.follow_facilities(state)
-        # And its taxiways, for the pilot's own taxi, at both ends.
-        self.follow_ground_layouts(state, session)
+        with timed("tick.follow", warn_over_ms=500):
+            self.follow_facilities(state)
+            # And its taxiways, for the pilot's own taxi, at both ends.
+            self.follow_ground_layouts(state, session)
 
         # And who is on the network, which decides whether this program is
         # entitled to say anything at all. The poll is in the background; the
@@ -3602,35 +3604,38 @@ class Engine:
 
         # A liftoff off a landing rollout is classified first, so that the
         # surface watch does not take a bounce for a takeoff.
-        self._note_rollout_liftoff(previous, state, session)
-        self._follow_route(state)
-        # And the simulator's own loaded plan, which is the route when the
-        # setting asks for it and nothing newer has replaced it.
-        self._poll_sim_plan()
+        with timed("tick.phase", warn_over_ms=500):
+            self._note_rollout_liftoff(previous, state, session)
+            self._follow_route(state)
+            # And the simulator's own loaded plan, which is the route when
+            # the setting asks for it and nothing newer has replaced it.
+            self._poll_sim_plan()
 
-        # What the aircraft is doing is checked before the phase is updated,
-        # because a departure and a touchdown are transitions: updating first
-        # would clear the very flags that say whether either was cleared.
-        self._watch_surface(previous, state, session)
+            # What the aircraft is doing is checked before the phase is
+            # updated, because a departure and a touchdown are transitions:
+            # updating first would clear the very flags that say whether
+            # either was cleared.
+            self._watch_surface(previous, state, session)
 
-        # Track the phase from what the aircraft is actually doing, so the
-        # controller stays in step even if the pilot skips a call.
-        self._update_phase(previous, state, session)
+            # Track the phase from what the aircraft is actually doing, so
+            # the controller stays in step even if the pilot skips a call.
+            self._update_phase(previous, state, session)
 
-        # And what the rollout liftoff turns out to be: back on the ground
-        # (a bounce), round the circuit, or round again.
-        self._after_rollout_liftoff(previous, state, session)
-        # Or nothing at all: still on the ground, so it was a full stop.
-        self._full_stop_after_touchdown(state, session)
+            # And what the rollout liftoff turns out to be: back on the
+            # ground (a bounce), round the circuit, or round again.
+            self._after_rollout_liftoff(previous, state, session)
+            # Or nothing at all: still on the ground, so it was a full stop.
+            self._full_stop_after_touchdown(state, session)
 
-        # The landing, measured. Written up a few seconds after the wheels
-        # touch, once a bounce has had time to show itself.
-        self._watch_landing(previous, state, session)
+            # The landing, measured. Written up a few seconds after the
+            # wheels touch, once a bounce has had time to show itself.
+            self._watch_landing(previous, state, session)
 
         # What the tug and the jetway are doing, so the controller does not
         # clear an aeroplane to move that is bolted to the stand.
         if self.config.gsx.enabled:
-            self.gsx.poll(state)
+            with timed("tick.gsx", warn_over_ms=500):
+                self.gsx.poll(state)
             for line in (self.gsx.changed(), self.gsx.notice()):
                 if line:
                     self.emit("info", line, key="log.ground_handling",
@@ -3646,15 +3651,16 @@ class Engine:
         # purpose: an aircraft is cleared for the approach by the radar
         # position that then passes it to the tower, not by the tower it
         # arrives on.
-        self._work_the_departure(state, session)
-        self._work_the_climb(state, session)
-        self._work_the_arrival(previous, state, session)
-        self._watch_airspace(state, session)
-        self._watch_restriction(state, session)
-        self._watch_radar_service(state, session)
-        self._watch_traffic(state, session)
-        self._watch_runway(state, session)
-        self._watch_points(state, session)
+        with timed("tick.atc", warn_over_ms=500):
+            self._work_the_departure(state, session)
+            self._work_the_climb(state, session)
+            self._work_the_arrival(previous, state, session)
+            self._watch_airspace(state, session)
+            self._watch_restriction(state, session)
+            self._watch_radar_service(state, session)
+            self._watch_traffic(state, session)
+            self._watch_runway(state, session)
+            self._watch_points(state, session)
         if not self.stand_down:
             self._say_held_reply(time.monotonic())
 
@@ -3676,19 +3682,22 @@ class Engine:
         # of it.
         self.cabin.ducked = self.radio_busy()
         try:
-            self.crew.follow(previous, state, session)
+            with timed("tick.crew", warn_over_ms=500):
+                self.crew.follow(previous, state, session)
         except Exception:
             log.debug("the crew raised", exc_info=True)
 
         # Autonomous flight tick (First Officer flying the aircraft)
         if self.autonomous_flight:
             try:
-                self.autonomous_flight.tick()
+                with timed("tick.autonomous", warn_over_ms=500):
+                    self.autonomous_flight.tick()
             except Exception:
                 log.debug("autonomous flight raised", exc_info=True)
 
         if self.config.traffic.enabled:
-            self._run_traffic(state, session)
+            with timed("tick.traffic", warn_over_ms=500):
+                self._run_traffic(state, session)
             # A simulator that will not create AI aircraft says so once,
             # rather than leaving a pilot looking out of the window for
             # aeroplanes that were promised at startup and never made.

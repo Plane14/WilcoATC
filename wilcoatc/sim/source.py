@@ -486,6 +486,15 @@ class SimConnectSource:
         ("AIRCRAFT_WIND_Z", "aircraft_wind_z_kt", "raw", "slow"),
         # Meters on the wire, feet in the state.
         ("PRESSURE_ALTITUDE", "pressure_altitude_ft", "m_ft", "slow"),
+        # The tug: whether the stand can push at all, whether one has been
+        # asked for and is still coming, and whether it is on the
+        # nosewheel. The autonomous pushback reads all three because the
+        # request event is a toggle -- a second one while the tug is still
+        # coming cancels it, so whether to send another has to be read
+        # rather than guessed from how long it has been quiet.
+        ("PUSHBACK_AVAILABLE", "pushback_available", "bool", "slow"),
+        ("PUSHBACK_WAIT", "pushback_wait", "bool", "slow"),
+        ("PUSHBACK_ATTACHED", "pushback_attached", "bool", "slow"),
     )
 
     def __init__(self, poll_interval: float = 0.25, request_timeout_ms: int = 400,
@@ -674,6 +683,19 @@ class SimConnectSource:
         "FUELSYSTEM_TANK_COUNT": [
             "How many fuel-system tanks the model has",
             b"FUELSYSTEM TANK COUNT", b"Number", "N"],
+        # The pushback service on the user's own stand (SDK Services
+        # Variables): whether the parking space offers a tug, whether one
+        # has been asked for and is still coming, and whether it is
+        # attached. UNVERIFIED on a running 2024.
+        "PUSHBACK_AVAILABLE": [
+            "Whether a push back is available on the parking space",
+            b"PUSHBACK AVAILABLE", b"Bool", "N"],
+        "PUSHBACK_WAIT": [
+            "Whether a pushback has been asked for and is still coming",
+            b"PUSHBACK WAIT", b"Bool", "N"],
+        "PUSHBACK_ATTACHED": [
+            "Whether the pushback tug is attached to the aircraft",
+            b"PUSHBACK ATTACHED", b"Bool", "N"],
     }
 
     @classmethod

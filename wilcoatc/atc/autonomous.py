@@ -1397,6 +1397,18 @@ class AutonomousFlight:
             self._goto_sub("request")
 
         elif sub == "request":
+            # A stand the simulator says has no pushback will never send
+            # a tug: rather than ask into silence, an aeroplane that can
+            # drive out just does. ``pushback_available`` unread -- None
+            # -- is not a refusal.
+            if getattr(state, "pushback_available", None) is False \
+                    and self._pushback_skippable():
+                self._emit("info", "No pushback at this stand; "
+                                   "taxiing out",
+                           "autonomous.pushback.skipped")
+                self._goto_sub("taxi")
+                self._transition(AutonomousPhase.TAXI_OUT)
+                return
             self._request_pushback()
             self.state.push_requested = True
             self._goto_sub("wait")
@@ -1412,18 +1424,38 @@ class AutonomousFlight:
                 self._transition(AutonomousPhase.TAXI_OUT)
                 return
             if not self.state.moved_since_push:
-                # The tug never moved it: ask again, but not often. The
-                # simulator's pushback is a toggle -- a second call while
-                # the first is still walking the aeroplane cancels it --
-                # so a retry waits well past the time a push takes, and
-                # there are only two of them before it is an error.
-                if self._sub_age() > 120.0 and self.state.push_retries < 2:
-                    self._request_pushback()
-                    self.state.push_retries += 1
-                    self.state.sub_entered_at = now
-                if self.state.push_retries >= 2 and self._sub_age() > 120.0:
-                    self._set_error("Pushback did not move the aircraft")
-                    return
+                # Whether the simulator has a live request: PUSHBACK WAIT
+                # while the tug is on its way, PUSHBACK ATTACHED once it
+                # is on the nosewheel. The request event is a toggle, so
+                # asking again while either is true cancels the push that
+                # is coming -- the retry is only for a request that never
+                # landed at all.
+                engaged = bool(getattr(state, "pushback_wait", False)
+                               or getattr(state, "pushback_attached",
+                                          False))
+                if not engaged:
+                    if self._sub_age() > 120.0 \
+                            and self.state.push_retries < 2:
+                        self._request_pushback()
+                        self.state.push_retries += 1
+                        self.state.sub_entered_at = now
+                    elif self._sub_age() > 120.0:
+                        # Asked for repeatedly and nothing ever engaged.
+                        # A light aeroplane on a ramp simply drives out;
+                        # what cannot is still an error rather than a
+                        # push through the terminal.
+                        if self._pushback_skippable():
+                            self._emit(
+                                "info",
+                                "No pushback answered at this stand; "
+                                "taxiing out",
+                                "autonomous.pushback.skipped")
+                            self._goto_sub("taxi")
+                            self._transition(AutonomousPhase.TAXI_OUT)
+                            return
+                        self._set_error("Pushback did not move the "
+                                        "aircraft")
+                        return
             if now - self.state.phase_entered_at > self.PUSHBACK_TIMEOUT:
                 self._set_error("Pushback timeout")
 
@@ -4021,6 +4053,18 @@ class AutonomousFlight:
     def _set_parking_brake(self) -> None:
         self._send_event(b"PARKING_BRAKE_SET", 1)
         self.director.parking_brake(True)
+
+    def _pushback_skippable(self) -> bool:
+        """Whether this aeroplane can leave the stand under its own power
+        when no tug ever answers: a light single or twin on a ramp taxis
+        straight out, where an airliner nose-in at a gate cannot. The
+        class comes from the aircraft table; anything heavier stays an
+        error so a real failure is never silently taxied through a
+        building."""
+        from . import aircraft_class as ac
+        return getattr(self, "_aircraft_class", "airliner") in (
+            ac.PISTON_SINGLE, ac.PISTON_TWIN, ac.TURBOPROP_SINGLE,
+            ac.HELICOPTER)
 
     def _request_pushback(self) -> None:
         """Request pushback through the ramp, then the simulator's own tug."""
