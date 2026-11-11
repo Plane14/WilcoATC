@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,7 +38,7 @@ from ..config import Config
 from ..navdata.build import haversine_nm
 from ..navdata.db import Airport, NavDB
 from ..sim.source import SimConnectSource
-from . import auto_nav, vspeeds
+from . import approach_flight, auto_nav, vspeeds
 from . import flying as fly
 from .ap import FlightDirector
 from .controller import ControllerBrain
@@ -151,6 +152,17 @@ class AutonomousState:
     go_arounds: int = 0
     go_around_at: float = 0.0
     missed_alt_ft: float = 0.0
+    # The cleared approach as a flyable recipe (approach_flight.resolve),
+    # resolved once and kept until the field or the runway changes; whether
+    # NAV1 has been tuned to its navaid yet, when that was last tried, and
+    # the circling pattern's path once the circle has started.
+    approach_recipe: object = None
+    approach_recipe_tried: bool = False
+    approach_recipe_key: tuple = ()
+    approach_tuned: bool = False
+    nav_tune_at: float = 0.0
+    circling: bool = False
+    circle_path: list = field(default_factory=list)
     # Landing: the flare's clock and the rollout's.
     flare_at: float = 0.0
     touchdown_at: float = 0.0
@@ -1010,9 +1022,18 @@ class AutonomousFlight:
                                 or 0.0))
         if not 100.0 <= descent_fpm <= 6000.0:
             descent_fpm = self.performance.descend_fpm
+        # A heading ATC has given -- a vector, the intercept -- is flown
+        # here as it is on the climb; without one the route's own guidance
+        # (NAV in managed mode, wings level otherwise) stands.
+        assigned_hdg = self.session.assigned_heading or 0.0
         self._apply_flight_director(state, altitude=target,
                                     vs_fpm=-descent_fpm,
+                                    heading=assigned_hdg or -1.0,
                                     speed_kt=speed)
+
+        # The approach's own navaid, tuned early enough that the needles
+        # are alive by the time the final is flown.
+        self._maybe_tune_nav(state, self._approach_recipe(state), now)
 
         # When the approach phase owns it, or we are close enough that the
         # approach logic should be flying.
@@ -1034,30 +1055,40 @@ class AutonomousFlight:
 
         self._configure_final(state)
 
-        # ILS capture where the needles say it is there; otherwise fly the
-        # runway heading to the threshold and let the glide path be flown
-        # by reference to distance.
+        # The cleared approach, as a recipe: which navaid, which course,
+        # which minima. Resolved once and kept until the field or the
+        # runway changes; the radio is tuned to its navaid on the way in.
+        recipe = self._approach_recipe(state)
+        self._maybe_tune_nav(state, recipe, now)
+
+        flown = False
+        if recipe is not None and recipe.family != "visual":
+            flown = self._fly_recipe(state, recipe, now)
         d = self.director
-        has_ils = getattr(state, "nav1_has_localizer", False) and \
-            getattr(state, "nav1_has_glideslope", False)
-        if has_ils and self.session.ifr:
-            d.approach(True)
-            self.state.ap_apr_mode = True
-            d.vs_hold(False)
-            self.state.ap_vs_mode = False
-        else:
-            # Non-precision or visual: fly the final course by heading and
-            # the glide path by vertical speed -- about 600 fpm on a
-            # three-degree path at approach speed, less once short.
-            if self.state.runway_heading <= 0:
-                self._find_runway(state)
-            if self.state.runway_heading > 0:
-                agl = state.altitude_agl_ft or 0.0
-                vs = -600.0 if agl > 400.0 else -250.0
-                self._apply_flight_director(
-                    state, vs_fpm=vs, heading=self.state.runway_heading,
-                    speed_kt=self.state.vapp_kt
-                    or self.performance.approach_kt)
+        if not flown:
+            # ILS capture where the needles say it is there; otherwise fly
+            # the runway heading to the threshold and let the glide path
+            # be flown by reference to distance.
+            has_ils = getattr(state, "nav1_has_localizer", False) and \
+                getattr(state, "nav1_has_glideslope", False)
+            if has_ils and self.session.ifr:
+                d.approach(True)
+                self.state.ap_apr_mode = True
+                d.vs_hold(False)
+                self.state.ap_vs_mode = False
+            else:
+                # Non-precision or visual: fly the final course by heading
+                # and the glide path by vertical speed -- about 600 fpm on
+                # a three-degree path at approach speed, less once short.
+                if self.state.runway_heading <= 0:
+                    self._find_runway(state)
+                if self.state.runway_heading > 0:
+                    agl = state.altitude_agl_ft or 0.0
+                    vs = -600.0 if agl > 400.0 else -250.0
+                    self._apply_flight_director(
+                        state, vs_fpm=vs, heading=self.state.runway_heading,
+                        speed_kt=self.state.vapp_kt
+                        or self.performance.approach_kt)
 
         # Stabilized approach: the numbers a crew actually checks.
         self._check_stabilized(state)
@@ -1380,6 +1411,267 @@ class AutonomousFlight:
         self.state.runway_lat, self.state.runway_lon, \
             self.state.runway_heading, self.state.runway_length_ft = found
 
+    # -- the cleared approach, as a recipe ---------------------------------
+
+    def _recipe_key(self, state) -> tuple:
+        """What the recipe was resolved for: a new field, runway or
+        request is a new recipe."""
+        dest = getattr(self.session, "destination", None)
+        return (getattr(dest, "ident", "") or "",
+                getattr(self.session, "arrival_runway", "") or "",
+                getattr(self.session, "requested_approach", "") or "")
+
+    def _approach_recipe(self, state):
+        """The cleared approach resolved for flying, once per leg.
+
+        approach_flight.resolve reads the controller's own choice off the
+        session -- "ILS Zulu", "RNAV Yankee", "VOR-A" -- and turns it into
+        a course, a final approach fix, minima and the navaid to tune.
+        """
+        key = self._recipe_key(state)
+        if self.state.approach_recipe_tried \
+                and key == self.state.approach_recipe_key:
+            return self.state.approach_recipe
+        self.state.approach_recipe_tried = True
+        self.state.approach_recipe_key = key
+        try:
+            recipe = approach_flight.resolve(
+                self.session, self.brain, self.navdb, state)
+        except (sqlite3.Error, AttributeError, TypeError, ValueError,
+                KeyError, IndexError, RuntimeError) as exc:
+            log.info("approach recipe failed: %s", exc)
+            recipe = None
+        self.state.approach_recipe = recipe
+        if recipe is not None:
+            # The approach's own minima, not the ILS's 200 ft every
+            # approach used to be judged against.
+            self.state.minima_ft = recipe.minima_ft
+            from ..logs import decision
+            decision("autonomous_approach", airport=recipe.ident,
+                     approach=recipe.name, family=recipe.family,
+                     line=recipe.line or None,
+                     approach_runway=recipe.approach_runway,
+                     landing_runway=recipe.landing_runway,
+                     navaid=recipe.navaid.ident if recipe.navaid else None,
+                     freq_mhz=(round(recipe.navaid.freq_mhz, 3)
+                               if recipe.navaid else None),
+                     minima_ft=recipe.minima_ft,
+                     circle_minima_ft=recipe.circle_minima_ft or None,
+                     why=recipe.why or None)
+        return recipe
+
+    def _maybe_tune_nav(self, state, recipe, now: float) -> None:
+        """NAV1 to the approach's navaid, once, with readback.
+
+        The localizer, the VOR or the NDB the procedure is flown on -- the
+        needles and the station callouts are only there if the radio is
+        tuned, and until now nothing ever tuned it. Tried again every ten
+        seconds until the frequency reads back; an aeroplane whose radios
+        the FO cannot reach simply keeps the old guidance.
+        """
+        nav = getattr(recipe, "navaid", None) if recipe is not None else None
+        if nav is None or not nav.freq_mhz:
+            return
+        sim = self.sim
+        if sim is None or not getattr(sim, "connected", False):
+            return
+        tuned = float(getattr(state, "nav1_freq", 0.0) or 0.0)
+        if tuned and abs(tuned - nav.freq_mhz) < 0.005:
+            if not self.state.approach_tuned:
+                self.state.approach_tuned = True
+                self._emit("info",
+                           f"NAV1 showing {nav.ident} "
+                           f"{nav.freq_mhz:.3f} MHz",
+                           "autonomous.nav_tuned")
+            return
+        if now - self.state.nav_tune_at < 10.0:
+            return
+        self.state.nav_tune_at = now
+        if hasattr(sim, "set_nav") and sim.set_nav(nav.freq_mhz, 1):
+            self._emit("info",
+                       f"Tuning NAV1 to {nav.ident} {nav.freq_mhz:.3f} MHz",
+                       "autonomous.nav_tune")
+
+    @staticmethod
+    def _magnetic(true_heading: float, state) -> float:
+        """A true course as the heading bug wants it: magnetic."""
+        from ..navdata.magvar import to_magnetic, variation
+
+        return to_magnetic(true_heading,
+                           variation(state.latitude, state.longitude)) % 360.0
+
+    def _fly_recipe(self, state, recipe, now: float) -> bool:
+        """The cleared approach's own guidance; False for the fallback.
+
+        What the aeroplane can actually fly decides the mode: an ILS with
+        live needles gets the autopilot's approach mode; a localizer
+        without a glideslope gets LOC mode and the path's vertical speed;
+        everything else -- VOR, NDB, RNAV, an ILS whose needles never came
+        alive -- is the computed final: the gate-FAF-threshold path flown
+        by heading and a three-degree vertical speed.
+        """
+        d = self.director
+        family = recipe.family
+        has_loc = bool(getattr(state, "nav1_has_localizer", False))
+        has_gs = bool(getattr(state, "nav1_has_glideslope", False))
+
+        # A circle, once it has started, owns the aeroplane until it is
+        # back on the landing runway's final.
+        if recipe.circling and self._circling(state, recipe):
+            return self._fly_circle(state, recipe)
+
+        if family == "ils" and has_loc and has_gs and self.session.ifr:
+            d.approach(True)
+            self.state.ap_apr_mode = True
+            d.vs_hold(False)
+            self.state.ap_vs_mode = False
+            return True
+        if family == "loc" and has_loc and self.session.ifr:
+            # The localizer for the lateral, the path for the vertical:
+            # there is no glideslope on this approach to capture.
+            d.localizer(True)
+            self.state.ap_apr_mode = False
+            self._fly_path_vertical(state, recipe)
+            return True
+        if family in ("ils", "loc", "vor", "ndb", "rnav"):
+            self._fly_computed(state, recipe)
+            return True
+        return False
+
+    def _path_vertical(self, state, recipe) -> float:
+        """The vertical speed the three-degree path asks for here."""
+        distance = state.distance_to(recipe.threshold_lat,
+                                     recipe.threshold_lon) \
+            if getattr(state, "has_position", False) else None
+        desired = approach_flight.profile_alt(
+            recipe, distance if distance is not None else 10.0)
+        alt = state.altitude_ft or 0.0
+        vs = approach_flight.sink_fpm(state.ground_speed_kt or 0.0)
+        # Capture: well above the path it comes down harder; below it the
+        # sink eases rather than deepening toward the ground.
+        if alt > desired + 300.0:
+            vs = min(900.0, vs * 1.5)
+        elif alt < desired - 150.0:
+            vs = max(200.0, vs * 0.4)
+        return -vs
+
+    def _fly_path_vertical(self, state, recipe) -> None:
+        """Vertical speed and speed for a mode that owns the lateral."""
+        self._apply_flight_director(
+            state, vs_fpm=self._path_vertical(state, recipe),
+            speed_kt=self.state.vapp_kt or self.performance.approach_kt)
+
+    def _fly_computed(self, state, recipe) -> None:
+        """The computed final: path steering for the lateral, the
+        three-degree profile for the vertical. What an RNAV, a VOR, an NDB
+        or an ILS whose needles never arrived all share -- the geometry is
+        the same, the minima and the tuned station are what differ."""
+        d = self.director
+        d.localizer(False)
+        if self.state.ap_apr_mode:
+            # APR was flying this approach a moment ago; the needles are
+            # gone or the procedure changed, and approach mode with no
+            # guidance behind it is worse than none.
+            d.approach(False)
+            self.state.ap_apr_mode = False
+        steer = auto_nav.path_steering(
+            state.latitude, state.longitude, approach_flight.legs(recipe),
+            lookahead_m=2500.0)
+        heading = steer.get("heading")
+        if heading is None:
+            heading = recipe.final_course
+        self._apply_flight_director(
+            state, vs_fpm=self._path_vertical(state, recipe),
+            heading=self._magnetic(heading, state),
+            speed_kt=self.state.vapp_kt or self.performance.approach_kt)
+
+    # -- circling -----------------------------------------------------------
+
+    def _circling(self, state, recipe) -> bool:
+        """Whether the aeroplane is in the circle, entering it once.
+
+        The published approach is done when the aeroplane is at or below
+        its minima or has passed the threshold; from there the pattern to
+        the landing runway takes over -- unless it is already lined up on
+        that runway's final, which the ordinary approach sees home.
+        """
+        if self.state.circling:
+            return not self._on_landing_final(state, recipe)
+        agl = state.altitude_agl_ft or 0.0
+        distance = state.distance_to(recipe.threshold_lat,
+                                     recipe.threshold_lon) \
+            if getattr(state, "has_position", False) else None
+        # The floor is the circling MDA: below the approach's own minima
+        # is already too low to be circling at.
+        floor = recipe.circle_minima_ft or recipe.minima_ft or 200.0
+        entered = agl <= floor + 100.0 \
+            or (distance is not None and distance < 1.5)
+        if not entered:
+            return False
+        path = approach_flight.circle_legs(recipe, self.navdb, state)
+        if not path:
+            return False
+        self.state.circling = True
+        self.state.circle_path = path
+        # Below this the go-around triggers are the circling minima's.
+        self.state.minima_ft = recipe.circle_minima_ft or recipe.minima_ft
+        self._emit("info", "Circling to land",
+                   "autonomous.circling")
+        return True
+
+    def _on_landing_final(self, state, recipe) -> bool:
+        """On the landing runway's final, close enough to land.
+
+        The recipe's own course, not ``state.runway_heading``: for a
+        circle that heading can still be the approach runway's.
+        """
+        if recipe.final_course <= 0 \
+                or not getattr(state, "has_position", False):
+            return False
+        track = getattr(state, "track_true", None) \
+            or state.heading_true or 0.0
+        err = abs((recipe.final_course - track + 540.0)
+                  % 360.0 - 180.0)
+        distance = state.distance_to(recipe.threshold_lat,
+                                     recipe.threshold_lon)
+        return err < 20.0 and distance < 4.0
+
+    def _fly_circle(self, state, recipe) -> bool:
+        """The circling pattern: hold the circling MDA, fly the rectangle
+        to the landing runway's final."""
+        if not self.state.circle_path:
+            path = approach_flight.circle_legs(recipe, self.navdb, state)
+            if not path:
+                self.state.circling = False
+                self.state.circle_path = []
+                return False
+            self.state.circle_path = path
+        d = self.director
+        # Whatever was tracking the approach runway's needles is done with
+        # them: the pattern is flown on the heading bug.
+        d.localizer(False)
+        if self.state.ap_apr_mode:
+            d.approach(False)
+            self.state.ap_apr_mode = False
+        steer = auto_nav.path_steering(
+            state.latitude, state.longitude, self.state.circle_path,
+            lookahead_m=2500.0)
+        target = recipe.field_elev_ft + \
+            (recipe.circle_minima_ft or recipe.minima_ft)
+        alt = state.altitude_ft or 0.0
+        vs = 0.0
+        if alt > target + 80.0:
+            vs = -250.0
+        elif alt < target - 80.0:
+            vs = 150.0
+        heading = steer.get("heading") or recipe.final_course
+        self._apply_flight_director(
+            state, altitude=int(target), vs_fpm=vs,
+            heading=self._magnetic(heading, state),
+            speed_kt=(self.state.vapp_kt or self.performance.approach_kt)
+            + 5.0)
+        return True
+
     def _field_elevation(self, state) -> float:
         airport = self.session.destination or self.session.departure
         if airport is not None:
@@ -1492,11 +1784,16 @@ class AutonomousFlight:
     def _start_go_around(self, state) -> None:
         """The go-around: power, pitch, configuration, climb away."""
         self.state.go_arounds += 1
+        self.state.circling = False
+        self.state.circle_path = []
         self.state.go_around_at = time.monotonic()
-        # Missed approach altitude: what was assigned, else a safe pattern
-        # height over the field.
-        self.state.missed_alt_ft = (self.session.assigned_altitude_ft
-                                    or self._field_elevation(state) + 2000.0)
+        # Missed approach altitude: what was assigned, else the procedure's
+        # own where the recipe knows it, else a safe pattern height.
+        recipe = self.state.approach_recipe
+        self.state.missed_alt_ft = (
+            self.session.assigned_altitude_ft
+            or (getattr(recipe, "missed_alt_ft", 0.0) or 0.0)
+            or self._field_elevation(state) + 2000.0)
         # From the landing flare the go-around is an approach again: the
         # phase owns the sub-step only from APPROACH down.
         if self.state.phase == AutonomousPhase.LANDING:
@@ -1648,6 +1945,12 @@ class AutonomousFlight:
                 self.state.stabilized = False
                 self.state.configured = ""
                 self.state.minima_ft = 200.0
+                self.state.approach_recipe = None
+                self.state.approach_recipe_tried = False
+                self.state.approach_recipe_key = ()
+                self.state.approach_tuned = False
+                self.state.circling = False
+                self.state.circle_path = []
                 self.state.tod_nm = 0.0
                 self._transition(AutonomousPhase.DESCENT)
                 self._goto_sub("")
@@ -1866,6 +2169,13 @@ class AutonomousFlight:
         self.state.shutdown_at = 0.0
         self.state.missed_alt_ft = 0.0
         self.state.go_around_at = 0.0
+        self.state.approach_recipe = None
+        self.state.approach_recipe_tried = False
+        self.state.approach_recipe_key = ()
+        self.state.approach_tuned = False
+        self.state.nav_tune_at = 0.0
+        self.state.circling = False
+        self.state.circle_path = []
         self._ga_flag_seen = False
         if self._dir is not None:
             self._dir.reset()

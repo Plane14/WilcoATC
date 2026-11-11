@@ -1212,9 +1212,18 @@ declares one, otherwise the type's table — and hands the leg to the
 autopilot for the climb, cruise and descent. Descent is planned from the
 distance to the field (~318 ft per mile on the three-degree path) and the
 aeroplane is configured by height: gear, then approach and final flap,
-speedbrakes armed. On the approach it captures the localizer and
-glideslope where the needles say an ILS is there, otherwise it flies the
-runway heading on a vertical-speed glide; it calls "stabilized" only when
+speedbrakes armed. On the descent it resolves the approach the controller
+actually cleared (`session.approach_choice`, via `wilcoatc/atc/
+approach_flight.py`) and tunes NAV1 to the procedure's own navaid — the
+localizer, the VOR or the NDB — so the needles are alive before the final.
+How it is flown depends on the kind: an ILS with live localizer and
+glideslope gets the autopilot's APR mode; a localizer-only procedure gets
+LOC mode for the lateral and the computed path's vertical speed; RNAV,
+VOR, NDB — and an ILS whose needles never arrive — fly the computed
+final, a gate-FAF-threshold path on the published (or derived) geometry
+with the procedure's own minima rather than a flat 200 ft. A circling
+procedure (VOR-A) holds its circling MDA and flies a rectangular pattern
+to the landing runway's final. It calls "stabilized" only when
 speed, sink rate, bank and centreline actually say so, and it goes around
 — power, pitch, configuration — when the tower calls it, when it is not
 stable below minimums, or when the sink rate or bank says so. The flare

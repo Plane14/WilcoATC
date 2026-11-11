@@ -134,6 +134,9 @@ class AircraftState:
     nav1_cdi: float = 127.0
     nav1_has_glideslope: bool = False
     nav1_gsi: float = 119.0
+    # What NAV1 is tuned to, MHz -- what the first officer set for the
+    # approach, so it can tell a needle that is alive from one that is not.
+    nav1_freq: float = 0.0
     ap_airspeed_kt: float = 0.0
     # What the first officer notices (wilcoatc.atc.notices): engine 1's
     # throttle, per cent; the fuel either side, gallons; the total by

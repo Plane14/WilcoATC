@@ -53,6 +53,7 @@ class RadioWriter(Protocol):
     def set_com(self, mhz: float, radio: int = 1,
                 standby: bool = False) -> bool: ...
     def swap_com(self, radio: int = 1) -> bool: ...
+    def set_nav(self, mhz: float, radio: int = 1) -> bool: ...
     def pushback(self) -> bool: ...
     def set_squawk(self, code: str) -> bool: ...
 
@@ -124,6 +125,36 @@ def decode_frequency(raw) -> float:
             if 118.0 <= candidate <= 136.999:
                 return round(candidate, 3)
     return 0.0
+
+
+def decode_nav_frequency(raw) -> float:
+    """A NAV receiver's frequency as MHz, whatever unit it came back in.
+
+    ``decode_frequency`` knows only the COM airband; a NAV radio also
+    covers the VOR/LOC band (108-117.95 MHz) and, where the aircraft has
+    one, the NDB band below 2 MHz. Magnitude decides, as there.
+    """
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    # MHz already: VOR/LOC tops out at 117.95 and an NDB at 0.535, so
+    # nothing a NAV radio says is between about 120 and 100,000 -- which
+    # is what keeps a kHz figure like 500 (an NDB) out of this branch.
+    if 0.1 <= value <= 130.0:
+        return round(value, 4)
+    # kHz.
+    if 100.0 <= value <= 2_000_000.0:
+        return round(value / 1000.0, 4)
+    # Hz.
+    if 100_000.0 <= value <= 2_000_000_000.0:
+        return round(value / 1_000_000.0, 4)
+    # BCD, the same packing the COM decoder knows.
+    return decode_frequency(raw)
 
 
 def encode_bcd16(mhz: float) -> int:
@@ -380,6 +411,7 @@ class SimConnectSource:
         ("NAV_CDI:1", "nav1_cdi", "raw", "slow"),
         ("NAV_HAS_GLIDE_SLOPE:1", "nav1_has_glideslope", "bool", "slow"),
         ("NAV_GSI:1", "nav1_gsi", "raw", "slow"),
+        ("NAV ACTIVE FREQUENCY:1", "nav1_freq", "navfreq", "slow"),
         ("AUTOPILOT_AIRSPEED_HOLD_VAR", "ap_airspeed_kt", "raw", "slow"),
         # The notices: power, and the fuel either side and by weight.
         ("GENERAL_ENG_THROTTLE_LEVER_POSITION:1", "throttle_pct", "raw", "slow"),
@@ -730,6 +762,8 @@ class SimConnectSource:
             return _text(raw)
         if kind == "freq":
             return decode_frequency(raw)
+        if kind == "navfreq":
+            return decode_nav_frequency(raw)
         if kind == "squawk":
             return decode_squawk(raw)
         if kind == "bool":
@@ -951,6 +985,82 @@ class SimConnectSource:
         name = b"COM_STBY_RADIO_SWAP" if int(radio) == 1 else b"COM2_RADIO_SWAP"
         return self._send(name, 0)
 
+    # Which event sets which NAV radio, in both the Hz and the BCD form.
+    # UNVERIFIED against a running simulator: the names are the SDK's
+    # (NAV1_RADIO_SET_HZ takes whole Hz, NAV1_RADIO_SET the BCD16 packing
+    # with the leading "1" implied, so it only reaches the 108-117.95 MHz
+    # band). The same learn-once-and-verify pattern as set_com applies.
+    _NAV_EVENTS: dict[int, tuple[bytes, bytes]] = {
+        1: (b"NAV1_RADIO_SET_HZ", b"NAV1_RADIO_SET"),
+        2: (b"NAV2_RADIO_SET_HZ", b"NAV2_RADIO_SET"),
+    }
+
+    _NAV_VARIABLES: dict[int, str] = {
+        1: "NAV ACTIVE FREQUENCY:1",
+        2: "NAV ACTIVE FREQUENCY:2",
+    }
+
+    def set_nav(self, mhz: float, radio: int = 1) -> bool:
+        """Put a frequency into the aircraft's NAV radio.
+
+        VOR, localizer and -- where the band is tuned -- NDB, in MHz. The
+        Hz event is tried first because it is the only one that can say an
+        NDB frequency; the BCD one is the fallback for the 108-117.95 MHz
+        band. Whether it took is read back off ``NAV ACTIVE FREQUENCY``,
+        not assumed, exactly as the COM radios are.
+        """
+        if not self._connected:
+            return False
+        try:
+            value = float(mhz)
+        except (TypeError, ValueError):
+            return False
+        if not (0.1 <= value <= 118.0):
+            return False
+
+        pair = self._NAV_EVENTS.get(int(radio))
+        variable = self._NAV_VARIABLES.get(int(radio), "")
+        if pair is None or not variable:
+            return False
+        hz_event, bcd_event = pair
+        key = ("nav", int(radio))
+
+        known = self._freq_event_style.get(key)
+        if known == "hz":
+            return self._send(hz_event, round(value * 1_000_000.0))
+        if known == "bcd":
+            packed = encode_bcd16(value)
+            return bool(packed) and self._send(bcd_event, packed)
+
+        if self._nav_reads(variable, value):
+            self._send(hz_event, round(value * 1_000_000.0))
+            return True
+        if self._send(hz_event, round(value * 1_000_000.0)) \
+                and self._nav_took(variable, value):
+            self._freq_event_style[key] = "hz"
+            return True
+        packed = encode_bcd16(value)
+        if packed and self._send(bcd_event, packed) \
+                and self._nav_took(variable, value):
+            self._freq_event_style[key] = "bcd"
+            return True
+        return False
+
+    def _nav_reads(self, variable: str, wanted: float) -> bool:
+        """Whether the NAV radio is already showing a frequency."""
+        found = decode_nav_frequency(self._get(variable))
+        return bool(found) and abs(found - wanted) < 0.005
+
+    def _nav_took(self, variable: str, wanted: float) -> bool:
+        """Whether the NAV radio moved to the frequency just sent."""
+        deadline = time.monotonic() + self.CONFIRM_S
+        while time.monotonic() < deadline:
+            time.sleep(self.CONFIRM_STEP_S)
+            found = decode_nav_frequency(self._get(variable))
+            if found and abs(found - wanted) < 0.005:
+                return True
+        return False
+
     def set_squawk(self, code: str) -> bool:
         """Set the transponder, so an assigned code is dialled in for you."""
         if not self._connected:
@@ -1092,6 +1202,10 @@ class ManualSource:
         setattr(self._state, active, getattr(self._state, standby))
         setattr(self._state, standby, was)
         return True
+
+    def set_nav(self, mhz: float, radio: int = 1) -> bool:
+        """No radios without a simulator; answered False, not raised."""
+        return False
 
     def set_squawk(self, code: str) -> bool:
         text = "".join(c for c in str(code) if c.isdigit())[:4]
