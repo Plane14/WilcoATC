@@ -109,6 +109,7 @@ class ApproachRecipe:
     missed_alt_ft: float = 0.0
     navaid: Navaid | None = None
     circling: bool = False
+    back_course: bool = False   # a localizer back course: needles sense reversed
     why: str = ""
 
     @property
@@ -268,8 +269,10 @@ def resolve(session, brain, navdb, state) -> ApproachRecipe | None:
     if end is None:
         return None
     t_lat, t_lon, course, elev = end
-    if kind == "LOC BC":
-        course = (course + 180.0) % 360.0
+    # A back course still lands *on* the runway -- the final course is the
+    # landing direction; only the needle's sensing runs the other way,
+    # which is why the autopilot must not fly it in front-course mode.
+    back_course = kind == "LOC BC"
 
     airliner = bool(getattr(getattr(session, "profile", None),
                             "airliner", True))
@@ -310,6 +313,7 @@ def resolve(session, brain, navdb, state) -> ApproachRecipe | None:
         missed_alt_ft=missed_ft or elev + 2500.0,
         navaid=navaid,
         circling=bool(getattr(choice, "circle_to", "")),
+        back_course=back_course,
         why=getattr(choice, "why", "") or "")
 
 

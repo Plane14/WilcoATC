@@ -2698,9 +2698,13 @@ class AutonomousFlight:
             d.vs_hold(False)
             self.state.ap_vs_mode = False
             return True
-        if family == "loc" and has_loc and self.session.ifr:
+        if family == "loc" and has_loc and self.session.ifr \
+                and not getattr(recipe, "back_course", False):
             # The localizer for the lateral, the path for the vertical:
-            # there is no glideslope on this approach to capture.
+            # there is no glideslope on this approach to capture. A back
+            # course is excluded: its needles sense reversed, and a
+            # front-course hold on them flies away from the runway --
+            # it takes the computed final like a VOR.
             d.localizer(True)
             self.state.ap_apr_mode = False
             self._fly_path_vertical(state, recipe)
