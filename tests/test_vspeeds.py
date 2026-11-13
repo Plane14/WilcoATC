@@ -6,13 +6,16 @@ pure and need no simulator.
 
 from __future__ import annotations
 
-import pytest
-
 from wilcoatc.atc.vspeeds import (
-    AIRLINER, CLASS_FIGURES, Speeds, Stated, TABLE, TRAFFIC_VR,
-    rotate_kt, speeds_for, table_speeds,
+    AIRLINER,
+    CLASS_FIGURES,
+    TRAFFIC_VR,
+    Speeds,
+    Stated,
+    rotate_kt,
+    speeds_for,
+    table_speeds,
 )
-
 
 # ----------------------------------------------------------------------
 # Speeds / Stated dataclasses

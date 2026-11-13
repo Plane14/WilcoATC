@@ -12,7 +12,6 @@ Usage (when Python is available):
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -20,8 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wilcoatc.atc.approach_flight import ApproachRecipe, legs, profile_alt
 from wilcoatc.atc.auto_nav import align, glide, path_steering, runway_end
-from wilcoatc.atc.flying import (AIRLINER, LIGHT, TURBOPROP, offset_from_track,
-                                 performance_for, step, turn_towards)
+from wilcoatc.atc.flying import (
+    AIRLINER,
+    offset_from_track,
+    performance_for,
+    step,
+    turn_towards,
+)
 from wilcoatc.atc.perftable import range_for, traffic_performance, type_perf
 from wilcoatc.atc.vspeeds import rotate_kt, speeds_for, table_speeds
 

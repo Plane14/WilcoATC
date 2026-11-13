@@ -1208,8 +1208,6 @@ describe(
     # The old name of traffic.debug.force_types, still read.
     debug_force_types=Setting("advanced", "debug", restart=True,
                               developer=True, hidden=True),
-    physics=Setting("traffic", "traffic", choices=("legacy", "model"),
-                    restart=True, advanced=True),
 )
 
 

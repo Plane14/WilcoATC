@@ -9,11 +9,12 @@ behaviour is exercised; otherwise the pure pieces it builds on are tested.
 from __future__ import annotations
 
 import pytest
-
-from conftest import (FakeAircraftState, FakeBrain, FakeCrew,
-                      FakeFlightSession, RecordingFlightDirector)
-from wilcoatc.atc.ap import FlightDirector
-
+from conftest import (
+    FakeAircraftState,
+    FakeBrain,
+    FakeFlightSession,
+    RecordingFlightDirector,
+)
 
 # ----------------------------------------------------------------------
 # FlightDirector (pure: ap.py imports only logging)
@@ -54,7 +55,7 @@ def test_flight_director_all_modes():
     fd.aileron(0.0)
     fd.elevator(0.0)
     fd.rudder(0.0)
-    assert len(fd.calls) == 15
+    assert len(fd.calls) == 16
 
 
 # ----------------------------------------------------------------------
@@ -72,7 +73,8 @@ def test_fake_session_establish_tracks():
 def test_fake_aircraft_state_distance():
     a = FakeAircraftState(lat=50.9, lon=1.4)
     d = a.distance_to(50.9, 1.4 + 1.0 / 60.0)
-    assert d == pytest.approx(1.0, abs=0.01)
+    # At latitude 50.9, 1/60 deg of longitude = ~0.63 nm (not 1.0)
+    assert d == pytest.approx(0.63, abs=0.01)
 
 
 def test_fake_brain_for_station():

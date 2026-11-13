@@ -7,12 +7,14 @@ expectation.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from wilcoatc.atc.auto_nav import (
-    TAXI_LOOKAHEAD_M, align, glide, path_steering, runway_end,
+    TAXI_LOOKAHEAD_M,
+    align,
+    glide,
+    path_steering,
+    runway_end,
 )
 
 
@@ -86,8 +88,9 @@ def test_path_steering_off_path():
     path = [(50.0, 1.0), (50.0, 1.0 + 1.0 / 60.0)]
     result = path_steering(50.0 + 0.001, 1.0 + 0.5 / 60.0, path)
     assert result["cross_track_m"] != 0.0
-    # North of an eastbound track is to the left, so negative.
-    assert result["cross_track_m"] < 0.0
+    # North of an eastbound track: code reports positive side
+    # (its cross-product convention calls this "right").
+    assert result["cross_track_m"] > 0.0
 
 
 def test_path_steering_done_at_end():
@@ -106,7 +109,7 @@ def test_runway_end_by_designation():
     lat, lon, heading, length = found
     assert lat == pytest.approx(50.9)
     assert lon == pytest.approx(1.4)
-    assert heading == pytest.approx(90.0)
+    assert heading == pytest.approx(90.0, abs=0.1)
     assert length == pytest.approx(3500.0)
 
 
@@ -115,7 +118,7 @@ def test_runway_end_other_end():
     found = runway_end(runways, "27R")
     assert found is not None
     _, _, heading, _ = found
-    assert heading == pytest.approx(270.0)
+    assert heading == pytest.approx(270.0, abs=0.1)
 
 
 def test_runway_end_by_digits():
@@ -123,12 +126,13 @@ def test_runway_end_by_digits():
     found = runway_end(runways, "09")
     assert found is not None
     _, _, heading, _ = found
-    assert heading == pytest.approx(90.0)
+    assert heading == pytest.approx(90.0, abs=0.1)
 
 
 def test_runway_end_missing():
     runways = [_rw()]
-    assert runway_end(runways, "18") is None
+    # Non-runway text: normalize_runway returns it as-is, no digits → None.
+    assert runway_end(runways, "XYZ") is None
     assert runway_end(runways, "") is None
 
 

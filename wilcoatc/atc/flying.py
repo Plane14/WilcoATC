@@ -72,7 +72,7 @@ FLARE_FPM = 160.0
 # state and config dataclasses
 
 
-@dataclass(frozen=True)
+@dataclass
 class FlightState:
     """The current state of an aeroplane, as six numbers.
 

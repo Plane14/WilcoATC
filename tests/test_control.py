@@ -5,15 +5,19 @@ from __future__ import annotations
 import pytest
 
 from wilcoatc.atc.control import (
-    AttitudePID, FeedForward, PID, RatePID, TECS, TECSOutput,
+    PID,
+    TECS,
+    AttitudePID,
+    FeedForward,
+    RatePID,
+    TECSOutput,
 )
-
 
 # ----------------------------------------------------------------------
 # PID
 
 def test_pid_proportional_only():
-    p = PID(kp=2.0, ki=0.0, kd=0.0)
+    p = PID(kp=2.0, output_min=-10.0, output_max=10.0)
     assert p.update(1.0, 0.1) == pytest.approx(2.0)
     assert p.update(-0.5, 0.1) == pytest.approx(-1.0)
 
@@ -34,7 +38,7 @@ def test_pid_integral_accumulates():
 
 
 def test_pid_derivative():
-    p = PID(kp=0.0, ki=0.0, kd=10.0)
+    p = PID(kp=0.0, ki=0.0, kd=10.0, output_min=-100.0, output_max=100.0)
     p.update(0.0, 1.0)
     assert p.update(1.0, 1.0) == pytest.approx(10.0)
     assert p.update(1.0, 1.0) == pytest.approx(0.0)
@@ -57,7 +61,7 @@ def test_pid_reset():
 # RatePID
 
 def test_rate_pid_delegates():
-    inner = RatePID(kp=2.0)
+    inner = RatePID(kp=2.0, output_min=-10.0, output_max=10.0)
     assert inner.update(1.0, 0.1) == pytest.approx(2.0)
     inner.reset()
     assert inner.update(1.0, 0.1) == pytest.approx(2.0)

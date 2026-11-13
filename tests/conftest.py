@@ -8,11 +8,10 @@ clock. Nothing here touches the simulator.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from wilcoatc.atc.traffic import TrafficInjector
-from wilcoatc.navdata.db import Station
 
 FIELD_LAT = 50.9
 FIELD_LON = 1.4

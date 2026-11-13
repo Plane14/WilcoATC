@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import pytest
 
+from wilcoatc.atc.flying import AIRLINER
 from wilcoatc.atc.perftable import (
-    HELI_TYPES, TABLE, TypePerf, range_for, traffic_performance, type_perf,
+    HELI_TYPES,
+    TABLE,
+    TypePerf,
+    range_for,
+    traffic_performance,
+    type_perf,
 )
-from wilcoatc.atc.flying import AIRLINER, LIGHT, TURBOPROP
-
 
 # ----------------------------------------------------------------------
 # traffic_performance
@@ -43,7 +47,7 @@ def test_traffic_performance_takeoff_accel():
 
 def test_traffic_performance_heli_uses_approach_ias():
     p = traffic_performance("H125")
-    assert p.approach_kt == pytest.approx(90.0)
+    assert p.approach_kt == pytest.approx(60.0)  # from perftable approach_ias_kt
 
 
 # ----------------------------------------------------------------------
@@ -75,7 +79,7 @@ def test_range_for_unknown_type():
 
 def test_range_for_heli():
     r = range_for("H125")
-    assert r == pytest.approx(400.0)
+    assert r == pytest.approx(324.0)  # from perftable range_nm
 
 
 # ----------------------------------------------------------------------

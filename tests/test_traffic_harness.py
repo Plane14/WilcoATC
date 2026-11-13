@@ -8,15 +8,14 @@ a simulator. Nothing here touches SimConnect.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
+from conftest import make_injector, snapshot_of
 
-from wilcoatc.atc.flying import (
-    Performance, Target, traffic_performance,
-)
+from wilcoatc.atc.flying import Performance, Target
+from wilcoatc.atc.perftable import traffic_performance
 from wilcoatc.atc.traffic import Flight
-
-from conftest import (make_injector, snapshot_of)
-
 
 # ----------------------------------------------------------------------
 # construction and field
@@ -43,8 +42,15 @@ def _takeoff_flight(written="TEST1", lat=50.9, lon=1.4,
                     heading=90.0, gs=50.0, alt=180.0,
                     type_code="A320",
                     perf: Performance | None = None) -> Flight:
+    aircraft = MagicMock()
+    aircraft.wake = ""
+    operator = MagicMock()
+    operator.icao = "TEST"
+    operator.language = "en"
+    operator.home = ()
     f = Flight(
         written=written, type_code=type_code,
+        aircraft=aircraft, language="en", operator=operator,
         arriving=False, runway="09L",
         latitude=lat, longitude=lon, heading=heading,
         ground_speed_kt=gs, altitude_ft=alt, on_ground=True,
@@ -117,12 +123,14 @@ def test_fly_model_uses_physics_model():
     now = 1000.0
     f = _takeoff_flight(gs=0.0)
     inject.flights.append(f)
+    # First call initializes _flown_at (elapsed=0, returns early).
     inject._fly(now)
-    # First call creates the physics_model.
-    assert f.physics_model is not None
-    # Second call uses the existing one (not recreated).
-    model_before = f.physics_model
+    # Second call creates the physics_model.
     inject._fly(now + 10.0)
+    assert f.physics_model is not None
+    # Third call uses the existing one (not recreated).
+    model_before = f.physics_model
+    inject._fly(now + 20.0)
     assert f.physics_model is model_before
     assert f.ground_speed_kt > 0.0
 
@@ -169,7 +177,10 @@ def test_fly_model_uses_perftable_config():
     f = _takeoff_flight(gs=0.0, type_code="C172")
     f.performance = traffic_performance("C172", light=True)
     inject.flights.append(f)
+    # First call initializes _flown_at.
     inject._fly(now)
+    # Second call creates the physics_model.
+    inject._fly(now + 10.0)
     assert f.physics_model is not None
     # C172 rotate speed from vspeeds table is 55 kt.
     assert f.physics_model.config.rotate_kt == pytest.approx(55.0)

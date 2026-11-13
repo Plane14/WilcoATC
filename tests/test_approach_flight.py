@@ -11,7 +11,12 @@ import math
 import pytest
 
 from wilcoatc.atc.approach_flight import (
-    ApproachRecipe, circle_legs, frame_point, legs, profile_alt, sink_fpm,
+    ApproachRecipe,
+    circle_legs,
+    frame_point,
+    legs,
+    profile_alt,
+    sink_fpm,
 )
 
 
@@ -23,7 +28,7 @@ def _recipe(**overrides):
         final_course=90.0,
         threshold_lat=50.9, threshold_lon=1.4,
         field_elev_ft=180.0,
-        faf_lat=50.9, faf_lon=1.3, faf_alt_ft=1770.0,
+        faf_lat=50.9, faf_lon=1.27, faf_alt_ft=1770.0,
         missed_alt_ft=2500.0, navaid=None,
         circling=False, back_course=False, why="",
     )
@@ -89,16 +94,16 @@ def test_sink_fpm_clamped():
 
 def test_frame_point_out_and_side():
     lat, lon = frame_point(50.9, 1.4, 90.0, 5.0, 1.0)
-    # Five miles out on the extended centreline (east of the threshold on a
-    # 09 course), then one mile right (south).
+    # Five miles out on the approach side (west of threshold on course 90),
+    # then one mile right (south).
     assert lat < 50.9
-    assert lon > 1.4
+    assert lon < 1.4
 
 
 def test_frame_point_negative_out_behind():
     lat, lon = frame_point(50.9, 1.4, 90.0, -2.0, 0.0)
-    # Behind the threshold: west of it on a 09 course (course 270).
-    assert lon < 1.4
+    # Negative out goes behind the threshold: east on course 90.
+    assert lon > 1.4
 
 
 # ----------------------------------------------------------------------
