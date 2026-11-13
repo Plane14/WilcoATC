@@ -173,6 +173,7 @@ traffic:
   seed: 0
   callsigns: auto
   source: wilcoatc
+  physics: legacy
   live:
     enabled: true
 weather:
@@ -227,6 +228,7 @@ immersion:
   captain_name: Theo
   interphone: true
   verbosity: normal
+  autonomous_guidance: true
   controller:
     special_vfr: true
     runway_change: true

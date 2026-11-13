@@ -48,8 +48,9 @@ from . import circuit as circuitry
 from .circuit import (CIRCUIT_BASE_NM, CIRCUIT_CENTRELINE_NM,
                       CIRCUIT_UPWIND_NM, CIRCUIT_WIDTH_NM)
 from . import ground as groundwork
-from .flying import (AIRLINER, OWN_DECISIONS, Command, Performance, Target, glide_altitude,
-                     offset_from_track)
+from .flying import (AIRLINER, OWN_DECISIONS, Command, FlightModel,
+                     FlightState, Performance, Target, flight_config_for,
+                     glide_altitude, offset_from_track)
 from .flying import step as fly_step
 from .flying import FLARE_FPM, FLARE_FT, LIFTOFF_AFTER_S
 from .flying import LIGHT as LIGHT_PERFORMANCE
@@ -146,6 +147,10 @@ class Flight:
     # What it can do, and what it is currently trying to do.
     performance: Performance = AIRLINER
     target: Target = field(default_factory=Target)
+    # The stateful flight model, when traffic.physics is "model". Created
+    # on first use and kept for the life of the aeroplane so its integrated
+    # position persists across ticks instead of being rebuilt each time.
+    physics_model: FlightModel | None = None
 
     # What the controller has told it, and when each takes effect -- which is
     # when the readback finishes, not when the instruction goes out.
@@ -957,6 +962,11 @@ class TrafficInjector:
         # Whether the simulator is drawing aeroplanes at all right now. With
         # ``requires_sim`` and this off, nothing is invented.
         self.can_invent = True
+        # How invented aeroplanes move: "legacy" uses the module-level step()
+        # shim (rebuilt each tick); "model" keeps a stateful FlightModel per
+        # aeroplane that integrates its own position, heading, speed and
+        # altitude. The engine sets this from traffic.physics.
+        self.physics: str = "legacy"
         # Invented aeroplanes asked of the simulator and not yet confirmed by
         # it, with the moment each is given up on. Kept off ``flights`` so
         # that nothing -- the radio, the map, the runway, the sequence --
@@ -3670,8 +3680,34 @@ class TrafficInjector:
                         self._place(flight)
                     continue
             self._aim(flight)
-            fly_step(flight, flight.target, flight.performance, elapsed,
-                     self._surface_ft(flight))
+            if self.physics == "model":
+                if flight.physics_model is None:
+                    flight.physics_model = FlightModel(
+                        state=FlightState(
+                            latitude=flight.latitude,
+                            longitude=flight.longitude,
+                            altitude_ft=flight.altitude_ft,
+                            heading=flight.heading,
+                            ground_speed_kt=flight.ground_speed_kt,
+                            vertical_rate_fpm=getattr(
+                                flight, "vertical_rate_fpm", 0.0),
+                            on_ground=flight.on_ground,
+                        ),
+                        config=flight_config_for(flight.type_code),
+                    )
+                model = flight.physics_model
+                model.step(flight.target, elapsed,
+                           self._surface_ft(flight))
+                flight.latitude = model.state.latitude
+                flight.longitude = model.state.longitude
+                flight.altitude_ft = model.state.altitude_ft
+                flight.heading = model.state.heading
+                flight.ground_speed_kt = model.state.ground_speed_kt
+                flight.vertical_rate_fpm = model.state.vertical_rate_fpm
+                flight.on_ground = model.state.on_ground
+            else:
+                fly_step(flight, flight.target, flight.performance, elapsed,
+                         self._surface_ft(flight))
             self._after_flying(flight)
 
     def _advance(self, now: float) -> None:

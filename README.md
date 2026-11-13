@@ -1246,6 +1246,10 @@ and falls back where a model does not answer; a name the simulator does
 not know is remembered rather than asked again. `immersion.autonomous_use_sim_ai`
 is currently unused — there is no SimConnect path to the simulator's own
 AI pilot, so the First Officer always flies its own autopilot.
+`immersion.autonomous_guidance` chooses whether the First Officer uses its
+own flight model (PID, TECS, cascaded rate/attitude) to compute commands
+(`wilcoatc/atc/control.py`), or only the simulator's autopilot modes. On
+by default.
 `immersion.autonomous_chained_flights` keeps the aeroplane flying: after
 shutdown it picks a random suitable destination within range — runway
 length and ground services checked against the navdata — files a new leg
@@ -4173,6 +4177,7 @@ worth knowing about:
 | `traffic.lod.boarding_lead_s` / `boarding_s` | `120` / `240` | schedule mode: from booking to boarding, and how long boarding takes before the departure calls |
 | `traffic.debug_force_types` | `[]` | for testing a model: `[A321]` makes every invented aeroplane an A321 (real airlines and callsigns, forced type); empty is off |
 | `traffic.handling_limit` | `24` | how many vehicles are on the apron at once, stairs and tugs aside; fewer on a machine that is working hard |
+| `traffic.physics` | `legacy` | `model` gives each invented aeroplane its own stateful flight model (PID, TECS) instead of the phase-based step shim |
 | `toolbar.enabled` | `true` | `false` to stop serving the panel inside the simulator |
 | `toolbar.port` | `8787` | the fixed loopback port the panel finds the application on |
 | `ai.provider` | `none` | `ollama` or `anthropic` to understand non-standard phrasing |
@@ -4190,6 +4195,7 @@ worth knowing about:
 | `atc.spoken_numerals` | `false` | `true` to have the voice read figures rather than say the numerals |
 | `immersion.enabled` | `false` | `true` for a first officer and a cabin crew |
 | `immersion.verbosity` | `normal` | `quiet` for the callouts alone, `chatty` for a talkative cruise |
+| `immersion.autonomous_guidance` | `true` | `false` to use only the simulator's autopilot modes for autonomous flight, `true` to let the First Officer's own flight model compute commands |
 | `immersion.radio_readbacks` | `false` | `true` to have the other seat work the radio for you |
 | `immersion.recordings` | `true` | `false` to keep the synthesised cabin even where you have files |
 | `immersion.recordings_dir` | `''` | a sound pack you already have, wherever it lives |

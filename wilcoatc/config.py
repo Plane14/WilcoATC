@@ -1163,6 +1163,11 @@ class TrafficConfig:
     source: str = "auto"           # auto | wilcoatc | fsltl
     # The real aeroplanes round you. See LiveTrafficConfig; off.
     live: LiveTrafficConfig = field(default_factory=LiveTrafficConfig)
+    # How invented aeroplanes move: "legacy" keeps the phase-based placement
+    # and the module-level step() shim; "model" hands each airborne aeroplane
+    # to a stateful FlightModel that integrates its own position, heading,
+    # speed and altitude tick by tick. Default legacy changes nothing.
+    physics: str = "legacy"        # legacy | model
 
 
 describe(
@@ -1182,6 +1187,8 @@ describe(
                       choice_keys=("set.callsigns_auto", "set.callsigns_reg"),
                       restart=True, label="set.traffic_callsigns",
                       help="set.traffic_callsigns_why"),
+    physics=Setting("traffic", "traffic", choices=("legacy", "model"),
+                    restart=True, advanced=True),
     smooth_motion=Setting("traffic", "traffic", restart=True, advanced=True),
     fsltl_rules=Setting("traffic", "traffic", kind="path", restart=True,
                         advanced=True),
@@ -1201,6 +1208,8 @@ describe(
     # The old name of traffic.debug.force_types, still read.
     debug_force_types=Setting("advanced", "debug", restart=True,
                               developer=True, hidden=True),
+    physics=Setting("traffic", "traffic", choices=("legacy", "model"),
+                    restart=True, advanced=True),
 )
 
 
@@ -1667,7 +1676,15 @@ class ImmersionConfig:
     # Whether to use the simulator's AI pilot (AI Control) for parts of the
     # flight the First Officer doesn't explicitly manage. Off by default
     # because it conflicts with explicit autopilot control.
+    # UNUSED: this setting is read but not acted on. The First Officer flies
+    # every part of the flight itself; the simulator's AI pilot is never
+    # asked. Kept only so existing config.yaml files do not break.
     autonomous_use_sim_ai: bool = False
+    # Whether the First Officer uses its own flight model (control.py: PID,
+    # TECS, cascaded rate/attitude) to compute commands, or only the
+    # simulator's autopilot modes. On by default: the FO's own model is what
+    # drives the FlightDirector. Off, only the sim's autopilot is used.
+    autonomous_guidance: bool = True
 
     # The controller's half (see ControllerRealismConfig).
     controller: ControllerRealismConfig = field(
@@ -1756,7 +1773,11 @@ describe(
     autonomous_weather=Setting(label="set.autonomous_weather",
                                help="set.autonomous_weather_why", **_AUTONOMOUS),
     autonomous_use_sim_ai=Setting(label="set.autonomous_use_sim_ai",
-                                  help="set.autonomous_use_sim_ai_why", **_AUTONOMOUS),
+                                  help="set.autonomous_use_sim_ai_why",
+                                  **_AUTONOMOUS),
+    autonomous_guidance=Setting(label="set.autonomous_guidance",
+                                help="set.autonomous_guidance_why",
+                                **_AUTONOMOUS),
 )
 
 

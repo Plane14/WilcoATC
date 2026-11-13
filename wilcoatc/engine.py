@@ -378,6 +378,9 @@ class Engine:
         self.traffic.max_invented = self.config.traffic.in_simulator_limit
         # And the ones standing at the gates, on a budget of their own.
         self.traffic.parked = max(0, int(self.config.traffic.parked))
+        # How invented aeroplanes move: legacy keeps the step() shim, model
+        # gives each airborne aeroplane its own stateful FlightModel.
+        self.traffic.physics = self.config.traffic.physics
         # The aeroplanes the pilot put on the runway, waiting to be said once
         # the simulator has actually made them: callsign -> runway.
         self._spawned: dict[str, str] = {}

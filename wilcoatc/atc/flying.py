@@ -68,6 +68,59 @@ FLARE_FT = 40.0
 FLARE_FPM = 160.0
 
 
+# ----------------------------------------------------------------------
+# state and config dataclasses
+
+
+@dataclass(frozen=True)
+class FlightState:
+    """The current state of an aeroplane, as six numbers.
+
+    Latitude, longitude, altitude, heading, groundspeed and vertical rate,
+    plus whether the wheels are on the ground. This is all a flight model
+    needs to know; everything else (callsign, phase, runway) lives outside.
+    """
+
+    latitude: float = 0.0
+    longitude: float = 0.0
+    altitude_ft: float = 0.0
+    heading: float = 0.0
+    ground_speed_kt: float = 0.0
+    vertical_rate_fpm: float = 0.0
+    on_ground: bool = True
+
+
+@dataclass(frozen=True)
+class FlightConfig:
+    """What an aeroplane is allowed to do -- its performance limits.
+
+    One value per knob the flight model turns: turn rate, climb and descent
+    rates, acceleration and braking, takeoff and phase speeds, pattern
+    altitude, range and ceiling. Built per type from :mod:`wilcoatc.atc.perftable`
+    via :func:`flight_config_for`.
+    """
+
+    turn_rate: float = RATE_ONE          # degrees per second
+    climb_fpm: float = 2200.0
+    descend_fpm: float = 2000.0
+    accelerate_kt_s: float = 3.0         # knots per second
+    decelerate_kt_s: float = 2.0
+    takeoff_kt_s: float = 4.2
+    taxi_kt: float = 14.0
+    rotate_kt: float = 145.0
+    climb_kt: float = 220.0
+    cruise_kt: float = 280.0
+    approach_kt: float = 140.0
+    braking_kt_s: float = 4.5
+    pattern_agl_ft: float = 1500.0
+    range_nm: float = 0.0
+    ceiling_ft: float = 0.0
+
+
+# ----------------------------------------------------------------------
+# performance dataclass (backward compatible)
+
+
 @dataclass(frozen=True)
 class Performance:
     """Roughly what a class of aeroplane can do.
@@ -149,6 +202,45 @@ def performance_for(type_code: str, light: bool = False) -> Performance:
     if rotate is not None and rotate != base.rotate_kt:
         return replace(base, rotate_kt=rotate)
     return base
+
+
+def flight_config_for(type_code: str, light: bool = False) -> FlightConfig:
+    """A :class:`FlightConfig` for a type, sourced from perftable where it has
+    figures and from the class profile everywhere else.
+
+    This is the preferred way to build a :class:`FlightModel` for invented
+    traffic: it reads the EUROCONTROL database row (via
+    :func:`wilcoatc.atc.perftable.traffic_performance`) and falls back to the
+    class average where the table is silent.
+
+    ``Performance`` and :class:`FlightConfig` share the same fields, so the
+    conversion is field-for-field.
+    """
+    # Deferred import: perftable imports flying at module level, so a
+    # top-level import here would be circular.
+    from .perftable import traffic_performance
+
+    perf = traffic_performance(type_code, light=light)
+    return FlightConfig(
+        turn_rate=perf.turn_rate, climb_fpm=perf.climb_fpm,
+        descend_fpm=perf.descend_fpm,
+        accelerate_kt_s=perf.accelerate_kt_s,
+        decelerate_kt_s=perf.decelerate_kt_s,
+        takeoff_kt_s=perf.takeoff_kt_s,
+        taxi_kt=perf.taxi_kt,
+        rotate_kt=perf.rotate_kt,
+        climb_kt=perf.climb_kt,
+        cruise_kt=perf.cruise_kt,
+        approach_kt=perf.approach_kt,
+        braking_kt_s=perf.braking_kt_s,
+        pattern_agl_ft=perf.pattern_agl_ft,
+        range_nm=perf.range_nm,
+        ceiling_ft=perf.ceiling_ft,
+    )
+
+
+# ----------------------------------------------------------------------
+# target dataclass
 
 
 @dataclass
@@ -263,8 +355,94 @@ class Command:
 
 
 # ----------------------------------------------------------------------
-# moving an aeroplane
+# flight model: stateful aeroplane
+
+
+class FlightModel:
+    """A stateful aeroplane: given a target and a number of seconds, moves
+    itself in place.
+
+    Holds its own :class:`FlightState` and :class:`FlightConfig`. Create one
+    per aeroplane and call :meth:`step` each tick; the model integrates rather
+    than interpolates, so an aeroplane can be interrupted halfway through a
+    turn and do something else.
+
+    Pure math: no simulator, no session, no radio.
+    """
+
+    def __init__(self, state: FlightState | None = None,
+                 config: FlightConfig | None = None):
+        self.state = state if state is not None else FlightState()
+        self.config = config if config is not None else FlightConfig()
+
+    def step(self, target: Target, dt: float,
+             ground_elevation_ft: float = 0.0) -> None:
+        """Fly one slice of time, moving ``self.state`` in place.
+
+        Mirrors the module-level :func:`step` exactly: hold brakes, speed
+        target accelerates/decelerates, heading target turns, altitude target
+        climbs or descends, then the aeroplane moves along its heading at
+        whatever groundspeed that left.
+        """
+        if dt <= 0.0:
+            return
+
+        flight = self.state
+        perf = self.config
+
+        if target.hold:
+            # Told to stop, and stopping takes a moment: an aeroplane rolling
+            # to a holding point does not become stationary the instant the
+            # word is said.
+            flight.ground_speed_kt = max(
+                0.0, flight.ground_speed_kt - perf.braking_kt_s * dt)
+            if flight.ground_speed_kt <= STOPPED_KT:
+                flight.ground_speed_kt = 0.0
+                flight.vertical_rate_fpm = 0.0
+                return
+        elif target.speed_kt is not None:
+            flight.ground_speed_kt = _towards(
+                flight.ground_speed_kt, max(0.0, target.speed_kt),
+                target.accel_kt_s if target.accel_kt_s is not None
+                else perf.accelerate_kt_s,
+                perf.braking_kt_s if flight.on_ground
+                else perf.decelerate_kt_s,
+                dt)
+
+        if target.heading is not None:
+            # On the ground below taxi speed an aeroplane is steered, not
+            # turned, and it can pivot faster than it can bank.
+            rate = (perf.turn_rate * 3.0
+                    if flight.on_ground and flight.ground_speed_kt < 40.0
+                    else perf.turn_rate)
+            flight.heading = turn_towards(flight.heading, target.heading, rate,
+                                          dt, target.turn)
+
+        if target.altitude_ft is not None:
+            before = flight.altitude_ft
+            wanted = max(ground_elevation_ft, target.altitude_ft)
+            # A climb builds from the rate it has; a descent is not eased in,
+            # because the glide path is followed by it and lagging it would
+            # float every arrival above the slope.
+            rate = max(0.0, flight.vertical_rate_fpm or 0.0)
+            climb = min(perf.climb_fpm, rate + CLIMB_ONSET_FPM_S * dt)
+            descend = perf.descend_fpm
+            if target.max_descent_fpm is not None:
+                descend = min(descend, target.max_descent_fpm)
+            flight.altitude_ft = _towards(
+                flight.altitude_ft, wanted, climb / 60.0, descend / 60.0, dt)
+            flight.vertical_rate_fpm = (flight.altitude_ft - before) / dt * 60.0
+        else:
+            flight.vertical_rate_fpm = 0.0
+
+        if flight.ground_speed_kt > 0.0:
+            distance = flight.ground_speed_kt * (dt / 3600.0)
+            flight.latitude, flight.longitude = project(
+                flight.latitude, flight.longitude, flight.heading, distance)
+
+
 # ----------------------------------------------------------------------
+# moving an aeroplane (module-level, backward compatible)
 
 
 def turn_towards(heading: float, wanted: float, rate: float, dt: float,
@@ -302,59 +480,54 @@ def step(flight, target: Target, performance: Performance, dt: float,
     latitude, longitude, altitude_ft, heading, ground_speed_kt, on_ground --
     which is what a :class:`~wilcoatc.atc.traffic.Flight` carries. It is moved
     in place.
+
+    This is the backward-compatible shim: it wraps the flight object's
+    attributes in a :class:`FlightModel`, runs one step, and writes the
+    results back. New code should prefer constructing a :class:`FlightModel`
+    directly and calling :meth:`FlightModel.step`.
     """
     if dt <= 0.0:
         return
 
-    if target.hold:
-        # Told to stop, and stopping takes a moment: an aeroplane rolling to
-        # a holding point does not become stationary the instant the word is
-        # said.
-        flight.ground_speed_kt = max(
-            0.0, flight.ground_speed_kt - performance.braking_kt_s * dt)
-        if flight.ground_speed_kt <= STOPPED_KT:
-            flight.ground_speed_kt = 0.0
-            flight.vertical_rate_fpm = 0.0
-            return
-    elif target.speed_kt is not None:
-        flight.ground_speed_kt = _towards(
-            flight.ground_speed_kt, max(0.0, target.speed_kt),
-            target.accel_kt_s if target.accel_kt_s is not None
-            else performance.accelerate_kt_s,
-            performance.braking_kt_s if flight.on_ground
-            else performance.decelerate_kt_s,
-            dt)
+    model = FlightModel(
+        state=FlightState(
+            latitude=flight.latitude,
+            longitude=flight.longitude,
+            altitude_ft=flight.altitude_ft,
+            heading=flight.heading,
+            ground_speed_kt=flight.ground_speed_kt,
+            vertical_rate_fpm=getattr(flight, "vertical_rate_fpm", 0.0),
+            on_ground=flight.on_ground,
+        ),
+        config=FlightConfig(
+            turn_rate=performance.turn_rate,
+            climb_fpm=performance.climb_fpm,
+            descend_fpm=performance.descend_fpm,
+            accelerate_kt_s=(target.accel_kt_s if target.accel_kt_s is not None
+                             else performance.accelerate_kt_s),
+            decelerate_kt_s=(performance.braking_kt_s if flight.on_ground
+                             else performance.decelerate_kt_s),
+            takeoff_kt_s=performance.takeoff_kt_s,
+            taxi_kt=performance.taxi_kt,
+            rotate_kt=performance.rotate_kt,
+            climb_kt=performance.climb_kt,
+            cruise_kt=performance.cruise_kt,
+            approach_kt=performance.approach_kt,
+            braking_kt_s=performance.braking_kt_s,
+            pattern_agl_ft=performance.pattern_agl_ft,
+            range_nm=performance.range_nm,
+            ceiling_ft=performance.ceiling_ft,
+        ),
+    )
+    model.step(target, dt, ground_elevation_ft)
 
-    if target.heading is not None:
-        # On the ground below taxi speed an aeroplane is steered, not turned,
-        # and it can pivot faster than it can bank.
-        rate = (performance.turn_rate * 3.0
-                if flight.on_ground and flight.ground_speed_kt < 40.0
-                else performance.turn_rate)
-        flight.heading = turn_towards(flight.heading, target.heading, rate, dt,
-                                      target.turn)
-
-    if target.altitude_ft is not None:
-        before = flight.altitude_ft
-        wanted = max(ground_elevation_ft, target.altitude_ft)
-        # A climb builds from the rate it has; a descent is not eased in,
-        # because the glide path is followed by it and lagging it would
-        # float every arrival above the slope.
-        rate = max(0.0, getattr(flight, "vertical_rate_fpm", 0.0) or 0.0)
-        climb = min(performance.climb_fpm, rate + CLIMB_ONSET_FPM_S * dt)
-        descend = performance.descend_fpm
-        if target.max_descent_fpm is not None:
-            descend = min(descend, target.max_descent_fpm)
-        flight.altitude_ft = _towards(
-            flight.altitude_ft, wanted, climb / 60.0, descend / 60.0, dt)
-        flight.vertical_rate_fpm = (flight.altitude_ft - before) / dt * 60.0
-    else:
-        flight.vertical_rate_fpm = 0.0
-
-    if flight.ground_speed_kt > 0.0:
-        distance = flight.ground_speed_kt * (dt / 3600.0)
-        flight.latitude, flight.longitude = project(
-            flight.latitude, flight.longitude, flight.heading, distance)
+    flight.latitude = model.state.latitude
+    flight.longitude = model.state.longitude
+    flight.altitude_ft = model.state.altitude_ft
+    flight.heading = model.state.heading
+    flight.ground_speed_kt = model.state.ground_speed_kt
+    flight.vertical_rate_fpm = model.state.vertical_rate_fpm
+    flight.on_ground = model.state.on_ground
 
 
 def glide_altitude(elevation_ft: float, distance_nm: float,
@@ -381,8 +554,9 @@ def offset_from_track(lat: float, lon: float, from_lat: float, from_lon: float,
 
 
 __all__ = [
+    "FlightState", "FlightConfig", "FlightModel",
     "Performance", "Target", "Command", "ORDERS", "OWN_DECISIONS",
     "AIRLINER", "TURBOPROP", "LIGHT",
-    "performance_for", "step", "turn_towards", "glide_altitude",
-    "offset_from_track", "RATE_ONE", "RATE_LIGHT",
+    "performance_for", "flight_config_for", "step", "turn_towards",
+    "glide_altitude", "offset_from_track", "RATE_ONE", "RATE_LIGHT",
 ]
